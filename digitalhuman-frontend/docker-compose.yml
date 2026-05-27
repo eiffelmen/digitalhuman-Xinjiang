@@ -1,0 +1,11 @@
+services:
+  frontend:
+    build: .
+    image: zkxh-digitalhuman-front
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file:
+      - .env
+    volumes:
+      - ./certs:/certs:ro

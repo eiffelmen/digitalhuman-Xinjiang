@@ -1,0 +1,34 @@
+.DS_Store
+*.pyc
+__pycache__/
+
+# Local environments and caches
+.venv/
+venv/
+node_modules/
+dist/
+dist-electron/
+logs/
+
+# Local secrets and certificates
+.env
+.env.*
+!.env.example
+!.env.template
+certs/
+*.pem
+*.key
+*.crt
+
+# Runtime assets that should be stored outside GitHub
+realtime-digital-human/wav2lip256/wav2lip.pth
+realtime-digital-human/data/avatars/
+!realtime-digital-human/data/avatars/.gitkeep
+realtime-digital-human/data.zip
+realtime-digital-human/dataandwave2lip256.zip
+
+# Backups and local scratch files
+*bak*
+*.bak
+* copy.*
+*_patch*.py

@@ -1,0 +1,22 @@
+[Unit]
+Description=ZKXH Digital Human Interactive System
+Documentation=https://github.com/zkxh/digitalhuman
+After=network.target graphical.target
+
+[Service]
+Type=simple
+User=root
+Environment="DISPLAY=:0"
+Environment="XAUTHORITY=/root/.Xauthority"
+ExecStart=/opt/ZKXH-DigitalHuman/zkxh-digitalhuman --no-sandbox
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 安全设置
+PrivateTmp=true
+NoNewPrivileges=false
+
+[Install]
+WantedBy=graphical.target
