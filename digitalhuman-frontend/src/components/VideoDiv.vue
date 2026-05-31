@@ -5,10 +5,12 @@ import { nextTick, onMounted, onUnmounted, ref, defineEmits } from 'vue';
 import { buildApiUrl, buildWsUrl } from '@/config';
 import { getPublicUrl } from '@/utils/getAssets';
 let pc = null;
+let backendCloseSent = false;
 defineExpose({
 	getPoster,
 	start,
 	startPlayVideo,
+	stop,
 });
 
 const emit = defineEmits(['offerSuccess', 'videoReady']);
@@ -44,6 +46,10 @@ function getPoster() {
 
 function start() {
 	console.log('start eventBus.sessionId:', eventBus.sessionId);
+	if (pc && pc.signalingState !== 'closed') {
+		stop({ notifyBackend: true });
+	}
+	backendCloseSent = false;
 	loading.value = true;
 	var config = {
 		sdpSemantics: 'unified-plan',
@@ -89,14 +95,47 @@ function start() {
 	negotiate();
 }
 
-function stop() {
+function notifyBackendClose() {
+	const sessionid = eventBus.sessionId;
+	if (!sessionid || backendCloseSent) return;
+	backendCloseSent = true;
+
+	const url = buildApiUrl('backend', '/close_session');
+	const body = JSON.stringify({ sessionid });
+	try {
+		if (navigator.sendBeacon) {
+			const blob = new Blob([body], { type: 'application/json' });
+			if (navigator.sendBeacon(url, blob)) return;
+		}
+	} catch (e) {
+		console.warn('sendBeacon close_session failed, fallback to fetch', e);
+	}
+
+	fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body,
+		keepalive: true,
+	}).catch(e => console.warn('close_session failed', e));
+}
+
+function stop(options = {}) {
+	const { notifyBackend = true } = options;
+	if (notifyBackend) {
+		notifyBackendClose();
+	}
 	// close peer connection
 	loading.value = false;
 	try {
-		pc.close();
+		if (pc) pc.close();
 	} catch (e) {
 		console.log(e);
 	}
+	const videoElem = document.getElementById('video');
+	if (videoElem) videoElem.srcObject = null;
+	const audioElem = document.getElementById('audio');
+	if (audioElem) audioElem.srcObject = null;
+	pc = null;
 	console.log('webrtc closed');
 	store.changeWebrtcStatus(false);
 }
@@ -186,7 +225,11 @@ function negotiate() {
 
 const beforeUnloadHandler = () => {
 	console.log('webrtc closeing');
-	stop();
+	stop({ notifyBackend: true });
+};
+
+const pageHideHandler = () => {
+	stop({ notifyBackend: true });
 };
 
 onMounted(() => {
@@ -201,9 +244,14 @@ onMounted(() => {
 
 	// 关闭网页后清理
 	window.addEventListener('beforeunload', beforeUnloadHandler);
+	window.addEventListener('pagehide', pageHideHandler);
 });
 
-onUnmounted(() => {});
+onUnmounted(() => {
+	window.removeEventListener('beforeunload', beforeUnloadHandler);
+	window.removeEventListener('pagehide', pageHideHandler);
+	stop({ notifyBackend: true });
+});
 </script>
 <template>
 	<div class="w-100 h-100 position-relative d-flex align-center justify-center">

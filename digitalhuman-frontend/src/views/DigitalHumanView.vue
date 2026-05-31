@@ -145,13 +145,14 @@ function toggleFullScreen() {
  * @returns {Promise<void>}
  */
 async function greetUser(message) {
-  await digitalHumanSay(message);
+  await digitalHumanSay(message, eventBus.sessionId);
 }
 
 // 上报设备ID
 function handleReportDeviceId() {
 	try {
-		eventBus.sessionId = localStorage.getItem('deviceid');
+		eventBus.sessionId = uuidv4();
+		console.log('数字人会话ID:', eventBus.sessionId, '设备ID:', localStorage.getItem('deviceid'));
 		videoDivRef.value.start();
 	} catch(error) {
 		console.log("handleReportDeviceId-error:", error);
@@ -295,6 +296,9 @@ onUnmounted(() => {
 	if (stopAudioStream) {
 		stopAudioStream();
 		stopAudioStream = null;
+	}
+	if (videoDivRef.value && typeof videoDivRef.value.stop === 'function') {
+		videoDivRef.value.stop({ notifyBackend: true });
 	}
 	stopSpeakingPoll();
 	store.changeAvatarSpeaking(false);

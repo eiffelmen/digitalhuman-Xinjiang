@@ -34,13 +34,36 @@ export const sendMsg = async (msg) => {
 
 let heartbeatInternal
 const HEARTBEAT_INTERVAL = 5000
+function stopHeartbeat() {
+  if (heartbeatInternal) {
+    clearInterval(heartbeatInternal)
+    heartbeatInternal = null
+  }
+}
+
 function startHeartbeat() {
+  stopHeartbeat()
   heartbeatInternal = setInterval(() => {
-    llmSocket.send('ping')
+    if (llmSocket && llmSocket.readyState === WebSocket.OPEN) {
+      llmSocket.send('ping')
+    }
   }, HEARTBEAT_INTERVAL)
 }
 let llmSocket = null
+const closeLLMSocket = () => {
+  stopHeartbeat()
+  if (llmSocket) {
+    try {
+      llmSocket.close()
+    } catch (e) {
+      console.warn('llm socket close failed', e)
+    }
+    llmSocket = null
+  }
+}
+
 const initLLMSocket = () => {
+  closeLLMSocket()
   // ! 注意这里必须构建完整的WebSocket URL，否则Android webview 中无法访问相对URL路径
   const llmRecvUrl = buildWsUrl('backend', `/ws/${eventBus.sessionId || 0}`);
   console.log('llmRecvUrl: ', llmRecvUrl)
@@ -56,14 +79,12 @@ const initLLMSocket = () => {
       console.log('llm service closed')
       store.changLlmStatus(false)
       resolve('close')
-      clearInterval(heartbeatInternal)
-      heartbeatInternal = null
+      stopHeartbeat()
     })
-    llmSocket.addEventListener('error', () => {
-      console.log('llm service error')
+    llmSocket.addEventListener('error', (error) => {
+      console.log('llm service error', error)
       store.changLlmStatus(false)
-      clearInterval(heartbeatInternal)
-      heartbeatInternal = null
+      stopHeartbeat()
       reject(error)
     })
   })
@@ -87,5 +108,5 @@ export const testOpenAIApi = async () => {
 
 // initLLMSocket()
 
-export { llmSocket, initLLMSocket };
+export { llmSocket, initLLMSocket, closeLLMSocket };
 

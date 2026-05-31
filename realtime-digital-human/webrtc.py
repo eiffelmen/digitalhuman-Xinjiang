@@ -34,6 +34,7 @@ def _env_float(name: str, default: float) -> float:
 WEBRTC_AUDIO_QUEUE_MAX = _env_int("WEBRTC_AUDIO_QUEUE_MAX", 50)
 WEBRTC_VIDEO_QUEUE_MAX = _env_int("WEBRTC_VIDEO_QUEUE_MAX", 6)
 WEBRTC_DROP_LOG_INTERVAL = _env_float("WEBRTC_DROP_LOG_INTERVAL", 5.0)
+WEBRTC_VIDEO_LAG_RESET_S = _env_float("WEBRTC_VIDEO_LAG_RESET_S", 0.12)
 
 
 class PlayerStreamTrack(MediaStreamTrack):
@@ -135,6 +136,10 @@ class PlayerStreamTrack(MediaStreamTrack):
                 # wait = self._start + self.current_frame_count * VIDEO_PTIME - time.time()
                 if wait > 0:
                     await asyncio.sleep(wait)
+                elif wait < -WEBRTC_VIDEO_LAG_RESET_S:
+                    # 遇到上游推理、网络或浏览器短时 stall 时，不做长时间追帧突发发送。
+                    # 保持 PTS 单调，同时把发送节奏重新锚定到当前时间，降低长时间运行后的 jitter。
+                    self._start = time.time() - (self._timestamp / VIDEO_CLOCK_RATE)
             else:
                 self._start = time.time()
                 self._timestamp = 0

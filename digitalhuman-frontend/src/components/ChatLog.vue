@@ -2,7 +2,7 @@
 import 'recorder-core/src/engine/wav';
 import 'recorder-core/src/extensions/waveview';
 import { nextTick, onMounted, onUnmounted, ref } from 'vue';
-import { llmSocket, initLLMSocket as startInitLLMSocket } from '@/api/llm.js';
+import { llmSocket, initLLMSocket as startInitLLMSocket, closeLLMSocket } from '@/api/llm.js';
 import { isChinese } from '@/utils/string';
 import { getPublicUrl } from '@/utils/getAssets';
 import useInterruptibleStreamText from '@/utils/useInterruptibleStreamText';
@@ -301,10 +301,7 @@ defineExpose({
 onUnmounted(() => {
 	abortActiveRender();
 	clearAllTimeouts();
-	if (llmSocket && llmSocket.readyState === WebSocket.OPEN) {
-		llmSocket.close();
-	}
-	// llmSocket = null;
+	closeLLMSocket();
 });
 
 onMounted(() => {

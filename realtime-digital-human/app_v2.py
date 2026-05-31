@@ -44,6 +44,10 @@ from mylogger import logger
 
 
 WEBRTC_DISCONNECT_GRACE = float(os.environ.get("WEBRTC_DISCONNECT_GRACE", "10"))
+SESSION_WS_CLOSE_GRACE = float(os.environ.get("SESSION_WS_CLOSE_GRACE", "5"))
+MAX_ACTIVE_WEBRTC_SESSIONS = max(
+    1, int(os.environ.get("MAX_ACTIVE_WEBRTC_SESSIONS", "1"))
+)
 
 
 class AppState:
@@ -56,6 +60,8 @@ class AppState:
         self.model = None
         self.avatar = None
         self.llm_response_queues: Dict[str, asyncio.Queue] = {}
+        self.cleaning_sessions: set[str] = set()
+        self.offer_lock = asyncio.Lock()
 
 
 class ConfigManager:
@@ -145,31 +151,79 @@ async def cleanup_session(state: AppState, sessionid: str, pc=None, reason: str 
     """
     统一清理单个会话，避免 WebRTC 断线后线程、队列和数字人实例残留。
     """
+    if sessionid in state.cleaning_sessions:
+        logger.info(f"会话正在清理中，跳过重复清理 sessionid={sessionid}, reason={reason}")
+        return
+    state.cleaning_sessions.add(sessionid)
     logger.info(f"开始清理会话 sessionid={sessionid}, reason={reason}")
 
-    active_pc = pc or state.instanceid_pc.get(sessionid)
-    state.instanceid_pc.pop(sessionid, None)
-    if active_pc is not None:
-        state.pcs.discard(active_pc)
-        if active_pc.connectionState != "closed":
+    try:
+        active_pc = pc or state.instanceid_pc.get(sessionid)
+        state.instanceid_pc.pop(sessionid, None)
+        if active_pc is not None:
+            state.pcs.discard(active_pc)
+            if active_pc.connectionState != "closed":
+                try:
+                    await active_pc.close()
+                except Exception as e:
+                    logger.warning(f"关闭 WebRTC 连接失败 sessionid={sessionid}: {e}")
+
+        nerfreal = state.nerfreals.pop(sessionid, None)
+        if nerfreal is not None:
+            stop_nerfreal_instance(nerfreal)
+
+        ws = state.sessionid_ws.pop(sessionid, None)
+        if ws is not None and not ws.closed:
             try:
-                await active_pc.close()
+                await ws.close()
             except Exception as e:
-                logger.warning(f"关闭 WebRTC 连接失败 sessionid={sessionid}: {e}")
+                logger.warning(f"关闭 WebSocket 失败 sessionid={sessionid}: {e}")
 
-    nerfreal = state.nerfreals.pop(sessionid, None)
-    if nerfreal is not None:
-        stop_nerfreal_instance(nerfreal)
+        state.llm_response_queues.pop(sessionid, None)
+        logger.info(f"会话清理完成 sessionid={sessionid}")
+    finally:
+        state.cleaning_sessions.discard(sessionid)
 
-    ws = state.sessionid_ws.pop(sessionid, None)
-    if ws is not None and not ws.closed:
-        try:
-            await ws.close()
-        except Exception as e:
-            logger.warning(f"关闭 WebSocket 失败 sessionid={sessionid}: {e}")
 
-    state.llm_response_queues.pop(sessionid, None)
-    logger.info(f"会话清理完成 sessionid={sessionid}")
+async def cleanup_after_ws_close(state: AppState, sessionid: str):
+    """
+    浏览器刷新或关闭时，文本 WebSocket 通常会先断开。
+    如果短暂等待后没有新的文本 WebSocket 接上，主动回收该会话，避免旧推理线程继续占用资源。
+    """
+    await asyncio.sleep(SESSION_WS_CLOSE_GRACE)
+    if sessionid in state.nerfreals and sessionid not in state.sessionid_ws:
+        await cleanup_session(
+            state,
+            sessionid,
+            reason=f"text websocket closed for {SESSION_WS_CLOSE_GRACE:.1f}s",
+        )
+
+
+async def wait_for_session_cleanup(
+    state: AppState, sessionid: str, timeout: float = 5.0
+):
+    """同一个 sessionid 重新建联前，等待旧清理流程结束，避免误删新实例。"""
+    deadline = time.monotonic() + timeout
+    while sessionid in state.cleaning_sessions and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+
+
+async def cleanup_old_sessions_for_new_offer(state: AppState, keep_sessionid: str):
+    """限制活跃 WebRTC 会话数，防止多次刷新后旧会话堆积导致掉帧。"""
+    active_sessionids = [
+        sessionid
+        for sessionid in list(state.nerfreals.keys())
+        if sessionid != keep_sessionid
+    ]
+    overflow = len(active_sessionids) - (MAX_ACTIVE_WEBRTC_SESSIONS - 1)
+    if overflow <= 0:
+        return
+    for old_sessionid in active_sessionids[:overflow]:
+        await cleanup_session(
+            state,
+            old_sessionid,
+            reason=f"new offer; active session limit={MAX_ACTIVE_WEBRTC_SESSIONS}",
+        )
 
 
 async def generate_session(request):
@@ -203,6 +257,20 @@ async def offer(request):
     logger.info(f"接收到offer请求 sessionid={sessionid}")
 
     try:
+        async with state.offer_lock:
+            await wait_for_session_cleanup(state, sessionid)
+            if (
+                sessionid in state.nerfreals
+                or sessionid in state.instanceid_pc
+                or sessionid in state.sessionid_ws
+            ):
+                await cleanup_session(
+                    state,
+                    sessionid,
+                    reason="new offer replaces existing session",
+                )
+            await cleanup_old_sessions_for_new_offer(state, sessionid)
+
         # 创建数字人实例并添加到 session_manager
         nerfreal = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
@@ -211,7 +279,9 @@ async def offer(request):
             timeout=120.0,
         )
 
-        state.nerfreals[sessionid] = nerfreal
+        async with state.offer_lock:
+            state.nerfreals[sessionid] = nerfreal
+            await cleanup_old_sessions_for_new_offer(state, sessionid)
         logger.info(
             f"数字人实例创建成功，已添加到nerfreals: sessionid={sessionid}, nerfreal={nerfreal}"
         )
@@ -316,6 +386,34 @@ async def interrupt(request):
         content_type="application/json",
         text=json.dumps({"code": 0, "data": "ok"}),
     )
+
+
+async def close_session(request):
+    """
+    前端页面刷新/关闭时主动释放当前数字人会话。
+    """
+    state = request.app["state"]
+    try:
+        params = await request.json()
+    except Exception:
+        try:
+            params = json.loads(await request.text())
+        except Exception:
+            params = {}
+
+    sessionid = str(params.get("sessionid") or "").strip()
+    if not sessionid:
+        return web.json_response({"code": 400, "message": "缺少必要参数: sessionid"}, status=400)
+
+    if (
+        sessionid not in state.nerfreals
+        and sessionid not in state.instanceid_pc
+        and sessionid not in state.sessionid_ws
+    ):
+        return web.json_response({"code": 0, "data": "already closed"})
+
+    await cleanup_session(state, sessionid, reason="client requested close")
+    return web.json_response({"code": 0, "data": "closed"})
 
 
 async def human(request):
@@ -612,6 +710,7 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
         logger.warning(f"WebSocket连接关闭 sessionid={sessionid}")
         state.sessionid_ws.pop(sessionid, None)
         state.llm_response_queues.pop(sessionid, None)
+        asyncio.create_task(cleanup_after_ws_close(state, sessionid))
 
     return ws
 
@@ -873,6 +972,7 @@ if __name__ == "__main__":
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/human", human)
     appasync.router.add_post("/interrupt", interrupt)
+    appasync.router.add_post("/close_session", close_session)
     appasync.router.add_post("/set_audiotype", set_audiotype)
     appasync.router.add_post("/is_speaking", is_speaking)
     appasync.router.add_get("/list_sessions", list_sessions)
