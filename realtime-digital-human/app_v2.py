@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import inspect
 from typing import Dict
 import uuid
 import asyncio
@@ -41,6 +42,7 @@ from aiortc import (
     RTCConfiguration,
 )
 from mylogger import logger
+from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 
 
 WEBRTC_DISCONNECT_GRACE = float(os.environ.get("WEBRTC_DISCONNECT_GRACE", "10"))
@@ -380,6 +382,8 @@ async def interrupt(request):
     nerfreal = state.nerfreals[sessionid]
     if nerfreal is None:
         return web.json_response({"code": 400, "message": "数字人实例尚未初始化"}, status=400)
+    if hasattr(nerfreal, "set_active_chat_trace"):
+        nerfreal.set_active_chat_trace(None)
     nerfreal.flush_talk()
 
     return web.Response(
@@ -504,6 +508,62 @@ def _get_llm_response():
     return llm_response
 
 
+def _timed_llm_response(
+    llm_response,
+    message,
+    nerfreal,
+    sessionid,
+    result_queue,
+    trace_id=None,
+):
+    provider = os.environ.get("LLM_PROVIDER", "gongan")
+    start = now()
+    success = True
+    try:
+        log_perf(
+            "trace",
+            "llm_start",
+            trace_id=trace_id,
+            provider=provider,
+            sessionid=sessionid,
+            text_len=len(message),
+        )
+        log_timepoint(
+            "LLM",
+            "第一次请求",
+            trace_id=trace_id,
+            provider=provider,
+            sessionid=sessionid,
+            text_len=len(message),
+            first_char=message[:1],
+        )
+        signature = inspect.signature(llm_response)
+        if "trace_id" in signature.parameters:
+            return llm_response(
+                message,
+                nerfreal,
+                sessionid,
+                result_queue,
+                trace_id=trace_id,
+            )
+        return llm_response(message, nerfreal, sessionid, result_queue)
+    except Exception:
+        success = False
+        raise
+    finally:
+        log_perf(
+            "llm",
+            "response_total",
+            elapsed_ms(start),
+            provider=provider,
+            sessionid=sessionid,
+            text_len=len(message),
+            device="external",
+            trace_id=trace_id,
+            success=success,
+        )
+
+
 async def _llm_response_consumer(state: AppState):
     """后台任务：消费 LLM 响应队列并发送 WebSocket"""
     while True:
@@ -525,6 +585,9 @@ async def _llm_response_consumer(state: AppState):
 async def _handle_chat_request(params, sessionid, nerfreal, state: AppState):
     """处理chat请求"""
     llm_response = _get_llm_response()
+    trace_id = params.get("trace_id") or uuid.uuid4().hex[:12]
+    if hasattr(nerfreal, "set_active_chat_trace"):
+        nerfreal.set_active_chat_trace(trace_id)
     # 创建队列用于接收 LLM 响应
     result_queue = asyncio.Queue()
     state.llm_response_queues[sessionid] = result_queue
@@ -532,11 +595,13 @@ async def _handle_chat_request(params, sessionid, nerfreal, state: AppState):
     # 注意：即使 ws 不存在，也应调用 LLM（结果通过数字人音频输出）
     asyncio.get_event_loop().run_in_executor(
         None,
+        _timed_llm_response,
         llm_response,
         params["text"],
         nerfreal,
         sessionid,
         result_queue,
+        trace_id,
     )
 
     return web.Response(
@@ -896,6 +961,19 @@ if __name__ == "__main__":
         "--wav2lip_size", type=int, default=256, help="wavlip处理图像大小"
     )
     parser.add_argument(
+        "--wav2lip_backend",
+        type=str,
+        default=os.getenv("WAV2LIP_BACKEND", "pytorch"),
+        choices=["pytorch", "tensorrt", "trt"],
+        help="Wav2Lip推理后端：pytorch 或 tensorrt",
+    )
+    parser.add_argument(
+        "--wav2lip_engine_path",
+        type=str,
+        default=os.getenv("WAV2LIP_ENGINE_PATH", "./wav2lip256/wav2lip_fp16.engine"),
+        help="TensorRT engine文件路径，仅wav2lip_backend=tensorrt时使用",
+    )
+    parser.add_argument(
         "--tts",
         type=str,
         default=os.environ.get("TTS_PROVIDER", "gongantts"),
@@ -949,9 +1027,15 @@ if __name__ == "__main__":
         from lipreal import LipReal, load_model, load_avatar, warm_up
 
         logger.info(opt)
-        model = load_model(opt.model_path)
+        model = load_model(
+            opt.model_path,
+            backend=opt.wav2lip_backend,
+            engine_path=opt.wav2lip_engine_path,
+            batch_size=opt.batch_size,
+            modelres=opt.wav2lip_size,
+        )
         avatar = load_avatar(opt.avatar_id)
-        warm_up(opt.batch_size, model, 256)
+        warm_up(opt.batch_size, model, opt.wav2lip_size)
 
     opt.customopt = []
     if opt.customvideo_config != "":

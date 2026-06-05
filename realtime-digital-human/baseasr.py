@@ -1,3 +1,4 @@
+import os
 import queue
 import numpy as np
 import torch.multiprocessing as mp
@@ -12,8 +13,12 @@ class BaseASR:
         self.sample_rate = 16000
         # 320 samples per chunk (20ms * 16000 / 1000)
         self.chunk = self.sample_rate // self.fps
-        self.queue = queue.Queue()
-        self.output_queue = mp.Queue()
+        self.queue = queue.Queue(
+            maxsize=max(1, int(os.environ.get("ASR_INPUT_QUEUE_MAX", "250")))
+        )
+        self.output_queue = mp.Queue(
+            maxsize=max(1, int(os.environ.get("ASR_OUTPUT_QUEUE_MAX", "250")))
+        )
 
         self.batch_size = opt.batch_size
 
@@ -49,7 +54,17 @@ class BaseASR:
         self.queue.queue.clear()
 
     def put_audio_frame(self, audio_chunk):  # 16khz 20ms pcm
-        self.queue.put(audio_chunk)
+        try:
+            self.queue.put_nowait(audio_chunk)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(audio_chunk)
+            except queue.Full:
+                pass
 
     def get_audio_frame(self):
         try:

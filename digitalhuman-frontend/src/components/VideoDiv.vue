@@ -6,6 +6,10 @@ import { buildApiUrl, buildWsUrl } from '@/config';
 import { getPublicUrl } from '@/utils/getAssets';
 let pc = null;
 let backendCloseSent = false;
+let currentVideoStream = null;
+let currentAudioStream = null;
+let videoLoadedHandler = null;
+let videoPlayingHandler = null;
 defineExpose({
 	getPoster,
 	start,
@@ -17,6 +21,7 @@ const emit = defineEmits(['offerSuccess', 'videoReady']);
 
 function startPlayVideo() {
 	const videoElem = document.getElementById('video');
+	if (!videoElem) return;
 	videoElem.play().catch(error => {
 		console.error('Error playing video:', error);
 	});
@@ -69,26 +74,52 @@ function start() {
     ]; */
 
 	pc = new RTCPeerConnection(config);
+	const peer = pc;
 	// pc = new RTCPeerConnection();
 
 	// connect audio / video
-	pc.addEventListener('track', evt => {
+	peer.addEventListener('track', evt => {
 		if (evt.track.kind === 'video') {
 			const videoElem = document.getElementById('video');
+			if (!videoElem) return;
+			if (currentVideoStream && currentVideoStream !== evt.streams[0]) {
+				currentVideoStream.getTracks().forEach(track => track.stop());
+			}
+			if (videoLoadedHandler) {
+				videoElem.removeEventListener('loadedmetadata', videoLoadedHandler);
+			}
+			if (videoPlayingHandler) {
+				videoElem.removeEventListener('playing', videoPlayingHandler);
+			}
+			currentVideoStream = evt.streams[0];
 			videoElem.srcObject = evt.streams[0];
-			videoElem.addEventListener('loadedmetadata', () => {
+			videoLoadedHandler = () => {
 				nextTick(() => {
 					loading.value = false;
 				});
-			});
+			};
+			videoElem.addEventListener('loadedmetadata', videoLoadedHandler);
 
 			// 监听视频真正开始播放的事件
-			videoElem.addEventListener('playing', () => {
+			videoPlayingHandler = () => {
 				console.log('Video is now playing');
 				emit('videoReady', true);
-			}, { once: true });
+			};
+			videoElem.addEventListener('playing', videoPlayingHandler, { once: true });
 		} else {
-			document.getElementById('audio').srcObject = evt.streams[0];
+			const audioElem = document.getElementById('audio');
+			if (!audioElem) return;
+			if (currentAudioStream && currentAudioStream !== evt.streams[0]) {
+				currentAudioStream.getTracks().forEach(track => track.stop());
+			}
+			currentAudioStream = evt.streams[0];
+			audioElem.srcObject = evt.streams[0];
+		}
+	});
+	peer.addEventListener('connectionstatechange', () => {
+		if (pc !== peer) return;
+		if (['failed', 'disconnected'].includes(peer.connectionState)) {
+			stop({ notifyBackend: peer.connectionState === 'failed' });
 		}
 	});
 
@@ -132,9 +163,31 @@ function stop(options = {}) {
 		console.log(e);
 	}
 	const videoElem = document.getElementById('video');
-	if (videoElem) videoElem.srcObject = null;
+	if (videoElem) {
+		if (videoLoadedHandler) {
+			videoElem.removeEventListener('loadedmetadata', videoLoadedHandler);
+			videoLoadedHandler = null;
+		}
+		if (videoPlayingHandler) {
+			videoElem.removeEventListener('playing', videoPlayingHandler);
+			videoPlayingHandler = null;
+		}
+		videoElem.pause();
+		videoElem.srcObject = null;
+	}
 	const audioElem = document.getElementById('audio');
-	if (audioElem) audioElem.srcObject = null;
+	if (audioElem) {
+		audioElem.pause();
+		audioElem.srcObject = null;
+	}
+	if (currentVideoStream) {
+		currentVideoStream.getTracks().forEach(track => track.stop());
+		currentVideoStream = null;
+	}
+	if (currentAudioStream) {
+		currentAudioStream.getTracks().forEach(track => track.stop());
+		currentAudioStream = null;
+	}
 	pc = null;
 	console.log('webrtc closed');
 	store.changeWebrtcStatus(false);

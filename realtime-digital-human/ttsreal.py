@@ -15,8 +15,9 @@ import soundfile as sf
 from enum import Enum
 from io import BytesIO
 from loguru import logger
-from typing import Iterator
+from typing import Iterator, Optional
 from threading import Thread, Event, Lock
+from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 
 
 def _env_int(name: str, default: int) -> int:
@@ -46,16 +47,33 @@ class BaseTTS(object):
         self.chunk = self.sample_rate // self.fps
         self.input_stream = BytesIO()
 
-        self.msgqueue = queue.Queue()
+        self.msgqueue = queue.Queue(
+            maxsize=max(1, int(os.environ.get("TTS_TEXT_QUEUE_MAX", "32")))
+        )
         self.state = State.RUNNING
 
     def flush_talk(self):
         self.msgqueue.queue.clear()
         self.state = State.PAUSE
 
-    def put_msg_txt(self, msg):
+    def put_msg_txt(self, msg, trace_id=None, segment_index=None):
         if len(msg) > 0:
-            self.msgqueue.put(msg)
+            item = {
+                "text": msg,
+                "trace_id": trace_id,
+                "segment_index": segment_index,
+            }
+            try:
+                self.msgqueue.put_nowait(item)
+            except queue.Full:
+                try:
+                    self.msgqueue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.msgqueue.put_nowait(item)
+                except queue.Full:
+                    logger.warning("TTS text queue full; dropping newest segment")
 
     def render(self, quit_event):
         process_thread = Thread(target=self.process_tts, args=(quit_event,))
@@ -64,11 +82,82 @@ class BaseTTS(object):
     def process_tts(self, quit_event):
         while not quit_event.is_set():
             try:
-                msg = self.msgqueue.get(block=True, timeout=1)
+                queue_item = self.msgqueue.get(block=True, timeout=1)
                 self.state = State.RUNNING
             except queue.Empty:
                 continue
-            self.txt_to_audio(msg)
+            if isinstance(queue_item, dict):
+                msg = queue_item.get("text", "")
+                trace_id = queue_item.get("trace_id")
+                segment_index = queue_item.get("segment_index")
+            else:
+                msg = queue_item
+                trace_id = None
+                segment_index = None
+            if (
+                trace_id
+                and hasattr(self.parent, "is_active_chat_trace")
+                and not self.parent.is_active_chat_trace(trace_id)
+            ):
+                logger.info(
+                    f"Skip stale TTS segment trace_id={trace_id}, "
+                    f"segment_index={segment_index}, text_len={len(msg)}"
+                )
+                continue
+            start = now()
+            success = True
+            log_timepoint(
+                "TTS",
+                "收到第一个字",
+                trace_id=trace_id,
+                segment_index=segment_index,
+                first_char=msg[:1],
+                text_len=len(msg),
+                tts_type=getattr(self.opt, "tts", None),
+            )
+            if trace_id:
+                log_perf(
+                    "trace",
+                    "tts_start",
+                    trace_id=trace_id,
+                    segment_index=segment_index,
+                    text_len=len(msg),
+                    tts_type=getattr(self.opt, "tts", None),
+                )
+            if hasattr(self.parent, "set_active_tts_trace"):
+                self.parent.set_active_tts_trace(trace_id, segment_index)
+            try:
+                self.txt_to_audio(msg)
+            except Exception:
+                success = False
+                raise
+            finally:
+                duration_ms = elapsed_ms(start)
+                if hasattr(self.parent, "clear_active_tts_trace"):
+                    self.parent.clear_active_tts_trace()
+                log_perf(
+                    "tts",
+                    "synthesize",
+                    duration_ms,
+                    device="external",
+                    sessionid=getattr(self.opt, "sessionid", None),
+                    tts_type=getattr(self.opt, "tts", None),
+                    tts_server=getattr(self.opt, "TTS_SERVER", None),
+                    text_len=len(msg),
+                    trace_id=trace_id,
+                    segment_index=segment_index,
+                    success=success,
+                )
+                if trace_id:
+                    log_perf(
+                        "trace",
+                        "tts_done",
+                        duration_ms,
+                        trace_id=trace_id,
+                        segment_index=segment_index,
+                        text_len=len(msg),
+                        success=success,
+                    )
         logger.info('ttsreal thread stop')
 
     def txt_to_audio(self, msg):

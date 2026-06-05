@@ -9,6 +9,7 @@ export function useInterruptibleStreamText({ isChinese, onChunkRendered }) {
   let messageQueue = [];
   let renderAbortController = null;
   const staleStreamIds = new Set();
+  const MAX_STALE_STREAM_IDS = 20;
 
   function abortActiveRender() {
     if (renderAbortController) {
@@ -39,6 +40,9 @@ export function useInterruptibleStreamText({ isChinese, onChunkRendered }) {
 
     if (activeStreamId.value && activeStreamId.value !== msgId) {
       staleStreamIds.add(activeStreamId.value);
+      while (staleStreamIds.size > MAX_STALE_STREAM_IDS) {
+        staleStreamIds.delete(staleStreamIds.values().next().value);
+      }
     }
 
     abortActiveRender();
@@ -137,16 +141,27 @@ export function useInterruptibleStreamText({ isChinese, onChunkRendered }) {
         return;
       }
 
-      const timeoutId = setTimeout(() => {
+      let timeoutId = null;
+      const cleanup = () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        signal.removeEventListener('abort', onAbort);
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+
+      timeoutId = setTimeout(() => {
+        cleanup();
         if (!signal.aborted) {
           resolve();
         }
       }, ms);
 
-      signal.addEventListener('abort', () => {
-        clearTimeout(timeoutId);
-        reject(new DOMException('Aborted', 'AbortError'));
-      }, { once: true });
+      signal.addEventListener('abort', onAbort, { once: true });
     });
   }
 

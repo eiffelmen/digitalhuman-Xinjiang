@@ -15,13 +15,12 @@ import { buildWsUrl, buildApiUrl } from '@/config';
 import { WebSocketManager } from '@/utils/websocket';
 import { useAudioStream } from '@/composables/useAudioStream.js';
 
-// 使用 buildApiUrl 构建完整的 API URL(Electron 环境下)
-const adVideoSrc = buildApiUrl('main', '/static/反诈视频.mp4');
 const sessionId = ref('');
 let stopAudioStream = null;
 let speakingPollTimer = null;
 
 function startSpeakingPoll(sessionid) {
+	stopSpeakingPoll();
 	speakingPollTimer = setInterval(async () => {
 		try {
 			const res = await fetch(buildApiUrl('backend', '/is_speaking'), {
@@ -124,12 +123,7 @@ function recordChange(type) {
 
 function handleUserPress() {
 	// toggleFullScreen();
-	videoDivRef.value.startPlayVideo();
-
-	const adVideoElem = document.getElementById('ad-video');
-	if (adVideoElem) {
-		adVideoElem.muted = false;
-	}
+	videoDivRef.value?.startPlayVideo?.();
 }
 function toggleFullScreen() {
 	if (!document.fullscreenElement) {
@@ -161,6 +155,11 @@ function handleReportDeviceId() {
 
 // 初始化内容返回websocket，offer 成功即自动打招呼
 async function handleInitChatWebSocket() {
+	if (stopAudioStream) {
+		stopAudioStream();
+		stopAudioStream = null;
+	}
+	stopSpeakingPoll();
 	chatRef.value.initFn();
 	await greetUser('你好，有什么可以帮助您的。').catch(
 		error => console.error('打招呼失败:', error)
@@ -174,6 +173,10 @@ async function handleInitChatWebSocket() {
 
 // 初始化socket检测，接收安卓信息
 function handleInitSocket() {
+	if (androidSocketManager) {
+		androidSocketManager.close();
+		androidSocketManager = null;
+	}
 	const deviceid = localStorage.getItem('deviceid');
 
 	// 使用配置文件构建WebSocket URL
@@ -398,15 +401,13 @@ onUnmounted(() => {
 			v-if="showStandby"
 			class="standby-bg-wrapper"
 		>
-			<div class="standby-bg-content">
+				<div class="standby-bg-content">
 				<!-- <img
 					src="@/assets/imgs/demo.jpeg"
 					class="camera-image"
 				/> -->
-				<!-- todo: http://media.example.com:8000/static/反诈视频.mp4 -->
-				<video id="ad-video" class="camera-image" :src="adVideoSrc" autoplay loop></video>
+				</div>
 			</div>
-		</div>
 
 		<div v-if="!showStandby">
 			<img :src="getPublicUrl('/bottom_info.png')" class="position-absolute bottom-info" />

@@ -24,6 +24,7 @@ from tqdm import tqdm
 from loguru import logger
 from functools import lru_cache
 from collections import OrderedDict
+from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 
 import warnings
 
@@ -32,6 +33,34 @@ warnings.filterwarnings("ignore", category=UserWarning)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 logger.info('正在使用{}进行推理。'.format(device))
 torch.backends.cudnn.benchmark = True
+
+
+def _device_name():
+    if device == 'cuda':
+        return torch.cuda.get_device_name(0)
+    return 'cpu'
+
+
+def _cuda_mem_mb():
+    if device != 'cuda':
+        return None
+    return f"{torch.cuda.memory_allocated() / 1024 / 1024:.1f}"
+
+
+def _sync_device():
+    if device == 'cuda':
+        torch.cuda.synchronize()
+
+
+log_perf("wav2lip", "device", device=device, device_name=_device_name())
+
+
+def _normalize_backend(backend=None):
+    return (backend or os.getenv("WAV2LIP_BACKEND", "pytorch")).strip().lower()
+
+
+def _model_backend(model):
+    return getattr(model, "backend_name", "pytorch")
 
 
 def _load(checkpoint_path):
@@ -43,7 +72,37 @@ def _load(checkpoint_path):
     return checkpoint
 
 
-def load_model(path):
+def load_model(path, backend=None, engine_path=None, batch_size=16, modelres=256):
+    start = now()
+    backend = _normalize_backend(backend)
+    if backend in {"trt", "tensorrt"}:
+        engine_path = engine_path or os.getenv(
+            "WAV2LIP_ENGINE_PATH", "./wav2lip256/wav2lip_fp16.engine"
+        )
+        logger.info("从 {} 加载 TensorRT Wav2Lip engine。".format(engine_path))
+        from wav2lip_tensorrt import TensorRTWav2Lip
+
+        model = TensorRTWav2Lip(engine_path, device=device)
+        _sync_device()
+        log_perf(
+            "wav2lip",
+            "load_model",
+            elapsed_ms(start),
+            backend="tensorrt",
+            engine_path=engine_path,
+            device=device,
+            device_name=_device_name(),
+            batch_size=batch_size,
+            modelres=modelres,
+            cuda_mem_mb=_cuda_mem_mb(),
+        )
+        return model
+
+    if backend != "pytorch":
+        raise ValueError(
+            f"Unsupported Wav2Lip backend: {backend}. Use pytorch or tensorrt."
+        )
+
     model = Wav2Lip()
     logger.info("从 {} 加载检查点。".format(path))
     checkpoint = _load(path)
@@ -54,7 +113,18 @@ def load_model(path):
     model.load_state_dict(new_s)
 
     model = model.to(device)
-    return model.eval()
+    model = model.eval()
+    _sync_device()
+    log_perf(
+        "wav2lip",
+        "load_model",
+        elapsed_ms(start),
+        backend="pytorch",
+        device=device,
+        device_name=_device_name(),
+        cuda_mem_mb=_cuda_mem_mb(),
+    )
+    return model
 
 
 def load_avatar(avatar_id):
@@ -95,10 +165,23 @@ def load_avatar(avatar_id):
 
 @torch.no_grad()
 def warm_up(batch_size, model, modelres):
+    start = now()
     logger.info('模型预热中...')
     img_batch = torch.ones(batch_size, 6, modelres, modelres).to(device)
     mel_batch = torch.ones(batch_size, 1, 80, 16).to(device)
     model(mel_batch, img_batch)
+    _sync_device()
+    log_perf(
+        "wav2lip",
+        "warm_up",
+        elapsed_ms(start),
+        backend=_model_backend(model),
+        device=device,
+        device_name=_device_name(),
+        batch_size=batch_size,
+        modelres=modelres,
+        cuda_mem_mb=_cuda_mem_mb(),
+    )
 
 
 # def read_imgs(img_list, flag=False):
@@ -147,10 +230,63 @@ def __mirror_index(size, index):
     else:
         return size - res - 1
 
+def _drain_queue_nowait(target_queue):
+    cleared = 0
+    while True:
+        try:
+            target_queue.get_nowait()
+            cleared += 1
+        except Exception:
+            break
+    return cleared
+
+
+def _is_idle_frame_item(item):
+    try:
+        res_frame = item[0]
+        audio_frames = item[2]
+    except Exception:
+        return False
+
+    if res_frame is not None:
+        return False
+    if audio_frames is None:
+        return True
+    try:
+        return all(audio_type != 0 for _, audio_type in audio_frames)
+    except Exception:
+        return False
+
+
+def _consume_latest_queue_value(target_queue):
+    if target_queue is None:
+        return None
+
+    value = None
+    while True:
+        try:
+            value = target_queue.get_nowait()
+        except Exception:
+            break
+    return value
+
+
+def _replace_queue_value(target_queue, value):
+    if target_queue is None:
+        return
+
+    _consume_latest_queue_value(target_queue)
+    try:
+        target_queue.put_nowait(value)
+    except Exception:
+        pass
+
 
 @torch.inference_mode()
 def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
-              audio_out_queue, res_frame_queue, model, ready_event):
+              audio_out_queue, res_frame_queue, model, ready_event,
+              reset_event=None, fast_speech_event=None,
+              speech_start_index_queue=None):
     try:
         length = len(face_list_cycle)
         index = 0
@@ -166,7 +302,7 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
             dummy_img_masked[:, face.shape[0] // 2:] = 0
             dummy_img_batch = np.concatenate((dummy_img_masked, dummy_img), axis=3) / 255.0
             dummy_mel_batch = np.zeros((batch_size, 1, 80, 16), dtype=np.float32)
-            
+
             dummy_img_tensor = torch.FloatTensor(np.transpose(dummy_img_batch, (0, 3, 1, 2))).to(device)
             dummy_mel_tensor = torch.FloatTensor(dummy_mel_batch).to(device)
             model(dummy_mel_tensor, dummy_img_tensor)
@@ -179,56 +315,75 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
 
         last_mel_batch = None
         while not quit_event.is_set():
+            if reset_event is not None and reset_event.is_set():
+                last_mel_batch = None
+                start_index = _consume_latest_queue_value(speech_start_index_queue)
+                if start_index is not None:
+                    index = max(0, int(start_index))
+                reset_event.clear()
+            fast_first_pending = (
+                fast_speech_event is not None and fast_speech_event.is_set()
+            )
+
             if last_mel_batch is None:
                 try:
                     # 恢复超时时间为 0.04s，匹配 Batch 16 的节奏
                     mel_batch = audio_feat_queue.get(block=True, timeout=0.04)
                 except queue.Empty:
+                    if fast_first_pending:
+                        time.sleep(0.001)
+                        continue
                     # 队列为空，推送一帧待机帧以维持 WebRTC 心跳
-                    res_frame_queue.put((None, __mirror_index(length, index), None))
+                    res_frame_queue.put(
+                        (None, __mirror_index(length, index), None, index)
+                    )
                     index += 1
                     continue
             else:
                 mel_batch = last_mel_batch
                 last_mel_batch = None
+            current_batch_size = len(mel_batch)
+            current_batch_size = max(1, min(current_batch_size, batch_size))
 
             # 尝试获取对应的原始音频帧
-            # 关键：用短超时阻塞 get，给 mp.Queue feeder 时间 flush。
-            # 如果用 block=False，会因 mp.Queue 异步可见性偶发扑空，
-            # 而 fallback 路径只缓存 mel 不退还已消费的 audio，导致 mel/audio
-            # 消费比例失衡，最终 feat_queue 满 → ASR 阻塞 → out_queue 永空 → 死锁。
             is_all_silence = True
             audio_frames = []
             try:
-                for _ in range(batch_size * 2):
-                    frame, type = audio_out_queue.get(block=True, timeout=0.02)
+                for _ in range(current_batch_size * 2):
+                    # 改为非阻塞，防止进入推理时被 ASR 的瞬时延迟卡住
+                    frame, type = audio_out_queue.get(block=False)
                     audio_frames.append((frame, type))
                     if type == 0:
                         is_all_silence = False
             except queue.Empty:
-                # 真正长时间没有 audio（如 TTS 完全停顿）才会走到这里。
-                # 死锁兜底：连续 fallback 时丢弃缓存的 mel，让 ASR 能继续推进
-                # （即使下次循环重新从 feat_queue 取也只损失一个 mel batch）
-                last_mel_batch = None
-                # 同时清掉一个 feat_queue 槽位，给 ASR 解锁
-                try:
-                    audio_feat_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                # 把已经消费但没用的 audio 也补一帧 None 占位
-                res_frame_queue.put((None, __mirror_index(length, index), None))
+                # 原始音频还没准备好（TTS传输中或ASR计算中）
+                # 此时不能丢弃 mel_batch，存起来下次循环再试，本次先发待机帧
+                last_mel_batch = mel_batch
+                if fast_first_pending:
+                    time.sleep(0.001)
+                    continue
+                res_frame_queue.put(
+                    (None, __mirror_index(length, index), None, index)
+                )
                 index += 1
                 continue
 
             if is_all_silence:
-                for i in range(batch_size):
+                for i in range(current_batch_size):
                     res_frame_queue.put((None, __mirror_index(length, index),
-                                         audio_frames[i * 2:i * 2 + 2]))
+                                         audio_frames[i * 2:i * 2 + 2], index))
                     index += 1
             else:
+                if fast_first_pending:
+                    start_index = _consume_latest_queue_value(
+                        speech_start_index_queue
+                    )
+                    if start_index is not None:
+                        index = max(0, int(start_index))
                 t = time.perf_counter()
                 img_batch = []
-                for i in range(batch_size):
+                batch_start_index = index
+                for i in range(current_batch_size):
                     idx = __mirror_index(length, index + i)
                     face = face_list_cycle[idx]
                     img_batch.append(face)
@@ -250,21 +405,58 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                 mel_batch = torch.FloatTensor(
                     np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
 
+                _sync_device()
+                model_start = now()
                 with torch.no_grad():
                     pred = model(mel_batch, img_batch)
+                _sync_device()
+                model_duration_ms = elapsed_ms(model_start)
                 pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
+                if fast_first_pending:
+                    cleared_frames = _drain_queue_nowait(res_frame_queue)
+                    fast_speech_event.clear()
+                    log_perf(
+                        "wav2lip",
+                        "fast_first_frame_inference",
+                        model_duration_ms,
+                        backend=_model_backend(model),
+                        device=device,
+                        device_name=_device_name(),
+                        batch_size=batch_size,
+                        first_batch_size=current_batch_size,
+                        start_index=batch_start_index,
+                        start_avatar_index=__mirror_index(length, batch_start_index),
+                        cleared_wav2lip_frames=cleared_frames,
+                        cuda_mem_mb=_cuda_mem_mb(),
+                    )
 
                 counttime += (time.perf_counter() - t)
-                count += batch_size
+                count += current_batch_size
                 if count >= 100: # 恢复日志打印频率
-                    logger.info(f"实际平均推理FPS:{count/counttime:.4f}")
+                    fps = count / counttime
+                    logger.info(f"实际平均推理FPS:{fps:.4f}")
+                    log_perf(
+                        "wav2lip",
+                        "inference",
+                        counttime * 1000,
+                        backend=_model_backend(model),
+                        device=device,
+                        device_name=_device_name(),
+                        frames=count,
+                        batch_size=batch_size,
+                        last_batch_size=current_batch_size,
+                        fps=f"{fps:.4f}",
+                        avg_frame_ms=f"{counttime * 1000 / count:.2f}",
+                        last_model_ms=f"{model_duration_ms:.2f}",
+                        cuda_mem_mb=_cuda_mem_mb(),
+                    )
                     count = 0
                     counttime = 0
 
                 for i, res_frame in enumerate(pred):
                     res_frame_queue.put(
                         (res_frame, __mirror_index(length, index),
-                         audio_frames[i * 2:i * 2 + 2]))
+                         audio_frames[i * 2:i * 2 + 2], index))
                     index += 1
 
         logger.info('lipreal inference processor stop')
@@ -281,11 +473,67 @@ class LipReal(BaseReal):
     def __init__(self, opt, model, avatar):
         super().__init__(opt)
         self.fps = opt.fps
-        self.bg_img = cv2.imread(opt.bg_img)  # 背景图
+        self.bg_img_path = opt.bg_img
+        self.bg_fallback_bgr = self._parse_bgr_env(
+            os.getenv("WEBRTC_BG_FALLBACK_BGR"),
+            (160, 68, 10),
+        )
+        self.bg_img = cv2.imread(self.bg_img_path) if self.bg_img_path else None
+        if self.bg_img is None:
+            logger.warning(
+                f"背景图读取失败: {self.bg_img_path}, "
+                f"将使用兜底背景 BGR={self.bg_fallback_bgr}"
+            )
 
         self.batch_size = opt.batch_size  # 恢复为原始批次大小以提升稳定性
         self.res_frame_queue = queue.Queue(self.batch_size * 2)
         self.model = model
+        self._media_loop = None
+        self._audio_track = None
+        self._video_track = None
+        self.inference_reset_event = Event()
+        self.fast_speech_event = Event()
+        self.speech_start_index_queue = queue.Queue(maxsize=1)
+        self._idle_frame_index = 0
+        self._next_render_linear_index = 0
+        self._last_render_linear_index = None
+        self._last_render_avatar_index = None
+        self.video_queue_max = int(os.getenv("WEBRTC_VIDEO_QUEUE_MAX", "3") or 3)
+        self.sync_speech_start_index = os.getenv(
+            "WAV2LIP_SYNC_SPEECH_START_INDEX", "1"
+        ).lower() not in {"0", "false", "no"}
+        self.speech_start_bridge_frames = max(
+            0, int(os.getenv("WAV2LIP_SPEECH_START_BRIDGE_FRAMES", "0") or 0)
+        )
+        self.clear_tracks_on_speech = os.getenv(
+            "WEBRTC_CLEAR_TRACKS_ON_SPEECH", "0"
+        ).lower() in {"1", "true", "yes"}
+        self.video_max_width = int(os.getenv("WEBRTC_VIDEO_MAX_WIDTH", "540") or 0)
+        self.video_max_height = int(os.getenv("WEBRTC_VIDEO_MAX_HEIGHT", "960") or 0)
+        self.video_scale = float(os.getenv("WEBRTC_VIDEO_SCALE", "1.0") or 1.0)
+        self.render_cache_size = int(os.getenv("WEBRTC_RENDER_CACHE_SIZE", "1024") or 0)
+        self.render_preload = os.getenv("WEBRTC_RENDER_PRELOAD", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._render_cache = OrderedDict()
+        self._render_src_size = (0, 0)
+        self._render_output_size = (0, 0)
+        self._render_output_scale = 1.0
+        self._render_bg_img = None
+        logger.info(
+            "WebRTC output config: "
+            f"queue_max={self.video_queue_max}, "
+            f"sync_speech_start_index={self.sync_speech_start_index}, "
+            f"speech_start_bridge_frames={self.speech_start_bridge_frames}, "
+            f"clear_tracks_on_speech={self.clear_tracks_on_speech}, "
+            f"max_width={self.video_max_width}, "
+            f"max_height={self.video_max_height}, "
+            f"scale={self.video_scale}, "
+            f"render_cache_size={self.render_cache_size}, "
+            f"render_preload={self.render_preload}"
+        )
 
         self._init_avatar(avatar)
 
@@ -298,10 +546,18 @@ class LipReal(BaseReal):
 
     def update_bg_img(self, bg_img_path):
         logger.info(f'更新背景图片到: {bg_img_path}')
+        self.bg_img_path = bg_img_path
         self.bg_img = cv2.imread(bg_img_path)
+        if self.bg_img is None:
+            logger.warning(
+                f"背景图读取失败: {bg_img_path}, "
+                f"将使用兜底背景 BGR={self.bg_fallback_bgr}"
+            )
+        self._configure_render_assets(reset_cache=False)
 
     def _init_avatar(self, avatar):
         self.frame_list_cycle, self.face_list_cycle, self.coord_list_cycle, self.mask_list_cycle = avatar
+        self._configure_render_assets(reset_cache=True)
 
     def _init_inference_thread(self):
         self.inference_quit_event = Event()
@@ -311,30 +567,208 @@ class LipReal(BaseReal):
             args=(self.inference_quit_event, self.batch_size,
                   self.face_list_cycle, self.asr.feat_queue,
                   self.asr.output_queue, self.res_frame_queue, self.model,
-                  self.inference_ready))
+                  self.inference_ready, self.inference_reset_event,
+                  self.fast_speech_event, self.speech_start_index_queue))
         self.inference_thread.start()
         self.inference_ready.wait(timeout=5.0)  # 添加超时以防止死锁
 
-    def _clear_frame_queue(self):
-        while not self.res_frame_queue.empty():
+    def _drain_queue(self, target_queue):
+        cleared = 0
+        while True:
             try:
-                self.res_frame_queue.get_nowait()
-            except queue.Empty:
+                target_queue.get_nowait()
+                cleared += 1
+            except Exception:
                 break
+        return cleared
+
+    def _clear_frame_queue(self):
+        return self._drain_queue(self.res_frame_queue)
+
+    def _clear_frame_queue_keep_idle_tail(self, keep_tail=0):
+        drained = []
+        while True:
+            try:
+                drained.append(self.res_frame_queue.get_nowait())
+            except Exception:
+                break
+
+        if keep_tail <= 0 or not drained:
+            return len(drained), 0, None
+
+        idle_tail = []
+        for item in reversed(drained):
+            if not _is_idle_frame_item(item):
+                break
+            idle_tail.append(item)
+            if len(idle_tail) >= keep_tail:
+                break
+
+        idle_tail.reverse()
+        retained = 0
+        last_retained_linear_index = None
+        for item in idle_tail:
+            try:
+                self.res_frame_queue.put_nowait(item)
+                retained += 1
+                if len(item) >= 4:
+                    last_retained_linear_index = item[3]
+            except Exception:
+                break
+
+        return len(drained) - retained, retained, last_retained_linear_index
 
     def _clear_audio_queues(self):
         # 清理ASR相关的队列
+        input_size = self.asr.queue.qsize()
         self.asr.queue.queue.clear()
-        while not self.asr.output_queue.empty():
+        output_size = self._drain_queue(self.asr.output_queue)
+        feat_size = self._drain_queue(self.asr.feat_queue)
+        return input_size, output_size, feat_size
+
+    def _media_track_queue_sizes(self):
+        audio_size = 0
+        video_size = 0
+        for name, track in (("audio", self._audio_track), ("video", self._video_track)):
+            q = getattr(track, "_queue", None)
+            if q is None:
+                continue
             try:
-                self.asr.output_queue.get_nowait()
-            except:
-                break
-        while not self.asr.feat_queue.empty():
+                if name == "audio":
+                    audio_size = q.qsize()
+                else:
+                    video_size = q.qsize()
+            except Exception:
+                pass
+        return audio_size, video_size
+
+    def _clear_media_track_queues(self):
+        if self._audio_track is None and self._video_track is None:
+            return 0, 0
+
+        done = Event()
+        cleared = {"audio": 0, "video": 0}
+
+        def clear_track_queues():
+            for name, track in (("audio", self._audio_track), ("video", self._video_track)):
+                q = getattr(track, "_queue", None)
+                if q is None:
+                    continue
+                try:
+                    cleared[name] = q.qsize()
+                    q._queue.clear()
+                except Exception:
+                    cleared[name] = 0
+            done.set()
+
+        if self._media_loop is not None:
             try:
-                self.asr.feat_queue.get_nowait()
-            except:
-                break
+                self._media_loop.call_soon_threadsafe(clear_track_queues)
+                done.wait(timeout=0.3)
+            except Exception:
+                clear_track_queues()
+        else:
+            clear_track_queues()
+
+        return cleared["audio"], cleared["video"]
+
+    def _speech_start_linear_index(self, retained_bridge_frames=0,
+                                   last_retained_linear_index=None):
+        if not self.sync_speech_start_index:
+            return None
+
+        start_index = max(0, int(self._next_render_linear_index))
+        if last_retained_linear_index is not None:
+            start_index = max(start_index, int(last_retained_linear_index) + 1)
+        else:
+            start_index += max(0, int(retained_bridge_frames or 0))
+        return start_index
+
+    def _prepare_first_audio_frame(self):
+        enabled = os.getenv("WAV2LIP_FAST_FIRST_FRAME", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        if not enabled or self.speaking:
+            return
+
+        start = now()
+        first_batch_size = int(os.getenv("WAV2LIP_FIRST_BATCH_SIZE", "4") or 4)
+        first_batch_size = max(1, min(first_batch_size, self.batch_size))
+
+        input_size = self.asr.queue.qsize()
+        try:
+            self.asr.queue.queue.clear()
+        except Exception:
+            input_size = -1
+        output_size = self._drain_queue(self.asr.output_queue)
+        feat_size = self._drain_queue(self.asr.feat_queue)
+        frame_size, retained_bridge_frames, last_retained_linear_index = (
+            self._clear_frame_queue_keep_idle_tail(
+                self.speech_start_bridge_frames
+            )
+        )
+        if self.clear_tracks_on_speech:
+            audio_track_size, video_track_size = self._clear_media_track_queues()
+            preserved_audio_track_size = 0
+            preserved_video_track_size = 0
+        else:
+            audio_track_size = 0
+            video_track_size = 0
+            preserved_audio_track_size, preserved_video_track_size = (
+                self._media_track_queue_sizes()
+            )
+        speech_start_index = self._speech_start_linear_index(
+            retained_bridge_frames=retained_bridge_frames,
+            last_retained_linear_index=last_retained_linear_index,
+        )
+        if speech_start_index is not None:
+            _replace_queue_value(self.speech_start_index_queue, speech_start_index)
+
+        self.asr.force_next_batch_size = first_batch_size
+        self.inference_reset_event.set()
+        self.fast_speech_event.set()
+        log_perf(
+            "wav2lip",
+            "fast_first_frame_prepare",
+            elapsed_ms(start),
+            device="cpu",
+            trace_id=self._pending_wav2lip_trace_id,
+            segment_index=self._pending_wav2lip_segment_index,
+            first_batch_size=first_batch_size,
+            cleared_asr_input=input_size,
+            cleared_asr_output=output_size,
+            cleared_asr_feat=feat_size,
+            cleared_wav2lip_frames=frame_size,
+            retained_bridge_frames=retained_bridge_frames,
+            last_retained_linear_index=last_retained_linear_index,
+            speech_start_index=speech_start_index,
+            speech_start_avatar_index=(
+                self.mirror_index(len(self.frame_list_cycle), speech_start_index)
+                if speech_start_index is not None else None
+            ),
+            last_render_linear_index=self._last_render_linear_index,
+            last_render_avatar_index=self._last_render_avatar_index,
+            cleared_webrtc_audio=audio_track_size,
+            cleared_webrtc_video=video_track_size,
+            preserved_webrtc_audio=preserved_audio_track_size,
+            preserved_webrtc_video=preserved_video_track_size,
+        )
+
+    def flush_talk(self):
+        self.tts.flush_talk()
+        input_size, output_size, feat_size = self._clear_audio_queues()
+        frame_size = self._clear_frame_queue()
+        audio_track_size, video_track_size = self._clear_media_track_queues()
+        self.inference_reset_event.set()
+        self.speaking = False
+        logger.info(
+            "interrupt flush: cleared queues "
+            f"asr_input={input_size}, asr_output={output_size}, "
+            f"asr_feat={feat_size}, wav2lip_frames={frame_size}, "
+            f"webrtc_audio={audio_track_size}, webrtc_video={video_track_size}"
+        )
 
     def __del__(self):
         logger.info(f'lipreal() delete')
@@ -360,9 +794,7 @@ class LipReal(BaseReal):
         self._init_inference_thread()
 
     def blend_images(self, person_image, mask_image, background_image):
-        # out = person * mask/255 + bg * (1 - mask/255)
-        # 用 OpenCV SIMD uint8 路径实现，比 numpy float32 全图转换快 3-5 倍。
-        # 1080p 单帧从 ~60ms 降到 ~15ms，process_frames 才能稳定 25fps。
+        # OpenCV uint8 路径比逐帧 float32 矩阵转换更省内存，也更稳定。
         if mask_image.ndim == 2:
             mask3 = cv2.cvtColor(mask_image, cv2.COLOR_GRAY2BGR)
         else:
@@ -372,41 +804,199 @@ class LipReal(BaseReal):
         bg = cv2.multiply(background_image, inv_mask3, scale=1.0 / 255.0)
         return cv2.add(fg, bg)
 
+    def _target_output_size(self, w, h):
+        scale = self.video_scale if self.video_scale > 0 else 1.0
+        scale = min(scale, 1.0)
+
+        if self.video_max_width > 0 and w * scale > self.video_max_width:
+            scale = min(scale, self.video_max_width / w)
+        if self.video_max_height > 0 and h * scale > self.video_max_height:
+            scale = min(scale, self.video_max_height / h)
+
+        if scale >= 0.999:
+            return w, h, 1.0
+
+        target_w = max(2, int(w * scale))
+        target_h = max(2, int(h * scale))
+        # 偶数尺寸对 H264/VP8 编码更友好。
+        target_w -= target_w % 2
+        target_h -= target_h % 2
+        return target_w, target_h, scale
+
+    def _resize_output_frame(self, frame):
+        h, w = frame.shape[:2]
+        target_w, target_h, scale = self._target_output_size(w, h)
+        if scale >= 0.999:
+            return frame, w, h, w, h, 1.0
+        resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        return resized, w, h, target_w, target_h, scale
+
+    def _parse_bgr_env(self, raw_value, default):
+        if not raw_value:
+            return default
+
+        try:
+            values = [int(part.strip()) for part in raw_value.split(",")]
+            if len(values) != 3:
+                raise ValueError("expected 3 comma separated values")
+            return tuple(max(0, min(255, value)) for value in values)
+        except Exception:
+            logger.warning(
+                f"WEBRTC_BG_FALLBACK_BGR={raw_value} 格式无效，"
+                f"使用默认值 {default}"
+            )
+            return default
+
+    def _fallback_background(self, width, height):
+        return np.full((height, width, 3), self.bg_fallback_bgr, dtype=np.uint8)
+
+    def _configure_render_assets(self, reset_cache=False):
+        if not hasattr(self, "frame_list_cycle") or not self.frame_list_cycle:
+            return
+
+        src_h, src_w = self.frame_list_cycle[0].shape[:2]
+        out_w, out_h, out_scale = self._target_output_size(src_w, src_h)
+        self._render_src_size = (src_w, src_h)
+        self._render_output_size = (out_w, out_h)
+        self._render_output_scale = out_scale
+
+        bg_img = self.bg_img
+        if bg_img is None:
+            bg_img = self._fallback_background(src_w, src_h)
+        if bg_img.shape[1] != out_w or bg_img.shape[0] != out_h:
+            bg_img = cv2.resize(bg_img, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        self._render_bg_img = bg_img
+
+        if reset_cache:
+            self._render_cache.clear()
+
+        logger.info(
+            "WebRTC render assets: "
+            f"source={src_w}x{src_h}, output={out_w}x{out_h}, "
+            f"scale={out_scale:.3f}, cache_size={self.render_cache_size}"
+        )
+
+        if reset_cache and self.render_preload and out_scale < 0.999 and self.render_cache_size > 0:
+            preload_start = now()
+            preload_count = min(len(self.frame_list_cycle), self.render_cache_size)
+            for idx in range(preload_count):
+                self._get_render_assets(idx)
+            log_perf(
+                "webrtc",
+                "preload_render_assets",
+                elapsed_ms(preload_start),
+                device="cpu",
+                frames=preload_count,
+                source_size=f"{src_w}x{src_h}",
+                output_size=f"{out_w}x{out_h}",
+                output_scale=f"{out_scale:.3f}",
+                cached=len(self._render_cache),
+            )
+
+    def _scale_bbox(self, bbox):
+        src_w, src_h = self._render_src_size
+        out_w, out_h = self._render_output_size
+        y1, y2, x1, x2 = bbox
+        scale_x = out_w / src_w if src_w else 1.0
+        scale_y = out_h / src_h if src_h else 1.0
+        y1 = max(0, min(out_h, int(round(y1 * scale_y))))
+        y2 = max(y1 + 1, min(out_h, int(round(y2 * scale_y))))
+        x1 = max(0, min(out_w, int(round(x1 * scale_x))))
+        x2 = max(x1 + 1, min(out_w, int(round(x2 * scale_x))))
+        return y1, y2, x1, x2
+
+    def _get_render_assets(self, idx):
+        src_w, src_h = self._render_src_size
+        out_w, out_h = self._render_output_size
+        out_scale = self._render_output_scale
+        if out_scale >= 0.999:
+            return (
+                self.frame_list_cycle[idx],
+                self.mask_list_cycle[idx],
+                self.coord_list_cycle[idx],
+                src_w,
+                src_h,
+                out_w,
+                out_h,
+                out_scale,
+            )
+
+        cached = self._render_cache.get(idx)
+        if cached is not None:
+            self._render_cache.move_to_end(idx)
+            return (*cached, src_w, src_h, out_w, out_h, out_scale)
+
+        frame = cv2.resize(self.frame_list_cycle[idx], (out_w, out_h), interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(self.mask_list_cycle[idx], (out_w, out_h), interpolation=cv2.INTER_AREA)
+        bbox = self._scale_bbox(self.coord_list_cycle[idx])
+        if self.render_cache_size > 0:
+            self._render_cache[idx] = (frame, mask, bbox)
+            while len(self._render_cache) > self.render_cache_size:
+                self._render_cache.popitem(last=False)
+        return frame, mask, bbox, src_w, src_h, out_w, out_h, out_scale
+
+    def _put_track_frame(self, track, frame, loop):
+        if track is None or loop is None:
+            return
+
+        submit_frame = getattr(track, "submit_frame", None)
+        if callable(submit_frame):
+            submit_frame(loop, frame)
+            return
+
+        def put_frame():
+            try:
+                track._queue.put_nowait(frame)
+            except Exception as exc:
+                logger.debug(f"WebRTC queue put skipped: {exc}")
+
+        try:
+            loop.call_soon_threadsafe(put_frame)
+        except Exception as exc:
+            logger.debug(f"WebRTC loop put skipped: {exc}")
+
     def process_frames(self,
                        quit_event,
                        loop=None,
                        audio_track=None,
                        video_track=None):
-        last_queue_log = 0.0
-        while not quit_event.is_set():
-            now = time.monotonic()
-            audio_q = audio_track.queue_size()
-            video_q = video_track.queue_size()
-            if now - last_queue_log >= 30:
-                logger.info(
-                    "WebRTC queues: "
-                    f"audio={audio_q}/{audio_track.queue_maxsize()}, "
-                    f"video={video_q}/{video_track.queue_maxsize()}, "
-                    f"res={self._safe_qsize(self.res_frame_queue)}, "
-                    f"asr_in={self._safe_qsize(self.asr.queue)}, "
-                    f"asr_feat={self._safe_qsize(self.asr.feat_queue)}, "
-                    f"asr_out={self._safe_qsize(self.asr.output_queue)}"
-                )
-                last_queue_log = now
+        self._media_loop = loop
+        self._audio_track = audio_track
+        self._video_track = video_track
+        render_start = now()
+        render_count = 0
+        render_speaking_count = 0
+        render_idle_count = 0
 
-            # 音频不能像视频一样大量丢帧；接近上限时先等浏览器消费。
-            if audio_q >= max(1, audio_track.queue_maxsize() - 2):
-                time.sleep(0.01)
+        while not quit_event.is_set():
+            # 视频队列是最终画面帧率的关键，避免音频短时缓冲把视频生产一起卡住。
+            if video_track is not None and video_track._queue.qsize() > self.video_queue_max:
+                time.sleep(0.005)
                 continue
 
             try:
-                res_frame, idx, audio_frames = self.res_frame_queue.get(
-                    block=True, timeout=1)
+                frame_item = self.res_frame_queue.get(block=True, timeout=0.04)
+                if len(frame_item) >= 4:
+                    res_frame, idx, audio_frames, linear_idx = frame_item[:4]
+                else:
+                    res_frame, idx, audio_frames = frame_item
+                    linear_idx = self._next_render_linear_index
             except queue.Empty:
-                continue
+                linear_idx = self._next_render_linear_index
+                idx = self.mirror_index(len(self.frame_list_cycle), linear_idx)
+                res_frame = None
+                audio_frames = None
+            combine_needs_resize = False
+            idle_frame = (
+                audio_frames is None
+                or (audio_frames[0][1] != 0 and audio_frames[1][1] != 0)
+            )
+            if idle_frame:
+                linear_idx = self._next_render_linear_index
+                idx = self.mirror_index(len(self.frame_list_cycle), linear_idx)
 
             # 连续两帧均为静音数据，或者没有音频数据（处于等待状态）
-            if audio_frames is None or (audio_frames[0][1] != 0 and audio_frames[1][1] != 0):
+            if idle_frame:
                 self.speaking = False
                 audiotype = audio_frames[0][1] if audio_frames is not None else 0
                 # 自定义视频播放
@@ -416,16 +1006,36 @@ class LipReal(BaseReal):
                         self.custom_index[audiotype])
                     combine_frame = self.custom_img_cycle[audiotype][mirindex]
                     self.custom_index[audiotype] += 1
+                    combine_needs_resize = True
+                    src_h, src_w = combine_frame.shape[:2]
+                    out_w, out_h, out_scale = self._target_output_size(src_w, src_h)
                 else:
-                    combine_frame = self.frame_list_cycle[idx]
-                    mask_frame = self.mask_list_cycle[idx]
+                    (
+                        combine_frame,
+                        mask_frame,
+                        _,
+                        src_w,
+                        src_h,
+                        out_w,
+                        out_h,
+                        out_scale,
+                    ) = self._get_render_assets(idx)
                     combine_frame = self.blend_images(combine_frame,
-                                                      mask_frame, self.bg_img)
+                                                      mask_frame, self._render_bg_img)
             else:
                 self.speaking = True
-                bbox = self.coord_list_cycle[idx]
+                (
+                    base_frame,
+                    mask_frame,
+                    bbox,
+                    src_w,
+                    src_h,
+                    out_w,
+                    out_h,
+                    out_scale,
+                ) = self._get_render_assets(idx)
                 # 性能优化：禁止使用 copy.deepcopy，改用高效的 .copy()
-                combine_frame = self.frame_list_cycle[idx].copy()
+                combine_frame = base_frame.copy()
                 y1, y2, x1, x2 = bbox
                 try:
                     res_frame = cv2.resize(res_frame.astype(np.uint8),
@@ -434,9 +1044,8 @@ class LipReal(BaseReal):
                     continue
 
                 combine_frame[y1:y2, x1:x2] = res_frame
-                mask_frame = self.mask_list_cycle[idx]
                 combine_frame = self.blend_images(combine_frame, mask_frame,
-                                                  self.bg_img)
+                                                  self._render_bg_img)
 
             # 音画同步优化：优先推送音频包
             if audio_frames is not None:
@@ -448,7 +1057,7 @@ class LipReal(BaseReal):
                                            samples=frame.shape[0])
                     new_frame.planes[0].update(frame.tobytes())
                     new_frame.sample_rate = 16000
-                    audio_track.submit_frame(loop, new_frame)
+                    self._put_track_frame(audio_track, new_frame, loop)
             else:
                 # 维持 40ms 的静音（20ms * 2）以匹配 25fps 的视频节奏
                 silence_frame = np.zeros(self.chunk, dtype=np.int16)
@@ -456,19 +1065,76 @@ class LipReal(BaseReal):
                     new_frame = AudioFrame(format='s16', layout='mono', samples=self.chunk)
                     new_frame.planes[0].update(silence_frame.tobytes())
                     new_frame.sample_rate = 16000
-                    audio_track.submit_frame(loop, new_frame)
+                    self._put_track_frame(audio_track, new_frame, loop)
 
             # 音频包推送后再进行耗时的视频转换，确保声音优先
+            if combine_needs_resize:
+                combine_frame, src_w, src_h, out_w, out_h, out_scale = (
+                    self._resize_output_frame(combine_frame)
+                )
             new_frame = VideoFrame.from_ndarray(combine_frame, format="bgr24")
-            video_track.submit_frame(loop, new_frame)
+            if (
+                self.speaking
+                and getattr(self, "_pending_wav2lip_waiting", False)
+                and not getattr(self, "_pending_wav2lip_first_output_logged", False)
+            ):
+                self._pending_wav2lip_first_output_logged = True
+                self._pending_wav2lip_waiting = False
+                log_timepoint(
+                    "Wav2Lip",
+                    "流式输出第一帧",
+                    trace_id=self._pending_wav2lip_trace_id,
+                    segment_index=self._pending_wav2lip_segment_index,
+                    source_size=f"{src_w}x{src_h}",
+                    output_size=f"{out_w}x{out_h}",
+                    output_scale=f"{out_scale:.3f}",
+                    video_queue=video_track._queue.qsize() if video_track is not None else -1,
+                    audio_queue=audio_track._queue.qsize() if audio_track is not None else -1,
+                )
+            self._put_track_frame(video_track, new_frame, loop)
+            self._last_render_linear_index = linear_idx
+            self._last_render_avatar_index = idx
+            self._next_render_linear_index = max(
+                self._next_render_linear_index, int(linear_idx) + 1
+            )
+            self._idle_frame_index = self._next_render_linear_index
+            if (
+                not self.speaking
+                and getattr(self, "_pending_wav2lip_waiting", False)
+                and not getattr(self, "_pending_wav2lip_first_output_logged", False)
+            ):
+                _replace_queue_value(
+                    self.speech_start_index_queue,
+                    self._next_render_linear_index,
+                )
+
+            render_count += 1
+            if self.speaking:
+                render_speaking_count += 1
+            else:
+                render_idle_count += 1
+            if render_count >= 100:
+                render_ms = elapsed_ms(render_start)
+                log_perf(
+                    "webrtc",
+                    "render_frames",
+                    render_ms,
+                    device="cpu",
+                    fps=f"{render_count / max(render_ms / 1000, 0.001):.2f}",
+                    source_size=f"{src_w}x{src_h}",
+                    output_size=f"{out_w}x{out_h}",
+                    output_scale=f"{out_scale:.3f}",
+                    video_queue=video_track._queue.qsize() if video_track is not None else -1,
+                    audio_queue=audio_track._queue.qsize() if audio_track is not None else -1,
+                    speaking_frames=render_speaking_count,
+                    idle_frames=render_idle_count,
+                )
+                render_start = now()
+                render_count = 0
+                render_speaking_count = 0
+                render_idle_count = 0
 
         logger.info('Wav2Lip 处理帧线程停止...')
-
-    def _safe_qsize(self, q):
-        try:
-            return q.qsize()
-        except Exception:
-            return -1
 
     def render(self,
                quit_event,

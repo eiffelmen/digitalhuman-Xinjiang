@@ -56,6 +56,54 @@ bash run_digitalman_server.sh
 LLM_PROVIDER=rag LISTEN_PORT=8010 CUDA_VISIBLE_DEVICES=0 bash run_digitalman_server.sh
 ```
 
+### Wav2Lip TensorRT 加速
+
+默认仍使用 PyTorch 推理；如果部署机已经安装好 NVIDIA 驱动、CUDA 与 TensorRT，可先生成 TensorRT engine，再通过环境变量启用。
+
+1. 导出 ONNX：
+
+```bash
+python scripts/export_wav2lip_onnx.py \
+  --checkpoint ./wav2lip256/wav2lip.pth \
+  --output ./wav2lip256/wav2lip_256.onnx
+```
+
+2. 检查 ONNX 输入输出：
+
+```bash
+python scripts/inspect_wav2lip_onnx.py ./wav2lip256/wav2lip_256.onnx
+```
+
+3. 构建 TensorRT engine：
+
+```bash
+bash scripts/build_wav2lip_tensorrt.sh
+```
+
+4. 启用 TensorRT：
+
+```bash
+WAV2LIP_BACKEND=tensorrt \
+WAV2LIP_ENGINE_PATH=./wav2lip256/wav2lip_fp16.engine \
+bash run_digitalman_server.sh
+```
+
+相关性能开关可放在 `.env` 中：
+
+```bash
+WAV2LIP_FAST_FIRST_FRAME=1
+WAV2LIP_FIRST_BATCH_SIZE=4
+WAV2LIP_SYNC_SPEECH_START_INDEX=1
+WEBRTC_VIDEO_QUEUE_MAX=6
+WEBRTC_VIDEO_LAG_RESET_S=0.12
+ASR_INPUT_QUEUE_MAX=250
+ASR_OUTPUT_QUEUE_MAX=250
+TTS_TEXT_QUEUE_MAX=32
+PERF_LOG_ENABLED=1
+```
+
+没有生成 engine 时不要切到 `WAV2LIP_BACKEND=tensorrt`，否则服务会在加载模型阶段报错。
+
 ### 访问方式
 
 启动后可使用 `web/` 下的页面进行联调，例如：

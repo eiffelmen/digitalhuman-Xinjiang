@@ -20,6 +20,8 @@ export function useAudioStream(sessionId) {
   let audioWs = null
   let started = false
   let interruptCooling = false  // 防止重复触发打断
+  let interruptCoolingTimer = null
+  const MAX_BUFFERED_BYTES = 256 * 1024
 
   function start() {
     if (started) return
@@ -48,7 +50,8 @@ export function useAudioStream(sessionId) {
         autoGainControl: true,
       },
       onProcess(buffers, powerLevel, bufferDuration, bufferSampleRate) {
-        if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return
+        if (!started || !audioWs || audioWs.readyState !== WebSocket.OPEN) return
+        if (audioWs.bufferedAmount > MAX_BUFFERED_BYTES) return
 
         const pcm = Recorder.SampleData(
           [buffers[buffers.length - 1]],
@@ -60,7 +63,10 @@ export function useAudioStream(sessionId) {
         if (store.avatarSpeaking && !interruptCooling) {
           interruptCooling = true
           callInterrupt(sessionId).finally(() => {
-            setTimeout(() => { interruptCooling = false }, 500)
+            interruptCoolingTimer = setTimeout(() => {
+              interruptCooling = false
+              interruptCoolingTimer = null
+            }, 500)
           })
         }
 
@@ -86,12 +92,36 @@ export function useAudioStream(sessionId) {
 
   function stop() {
     started = false
+    interruptCooling = false
+    if (interruptCoolingTimer) {
+      clearTimeout(interruptCoolingTimer)
+      interruptCoolingTimer = null
+    }
     if (rec) {
-      rec.stop()
+      try {
+        rec.stop()
+      } catch (e) {
+        console.warn('[AudioStream] recorder stop failed', e)
+      }
+      try {
+        if (typeof rec.close === 'function') {
+          rec.close()
+        }
+      } catch (e) {
+        console.warn('[AudioStream] recorder close failed', e)
+      }
       rec = null
     }
     if (audioWs) {
-      audioWs.close()
+      try {
+        audioWs.onopen = null
+        audioWs.onmessage = null
+        audioWs.onerror = null
+        audioWs.onclose = null
+        audioWs.close()
+      } catch (e) {
+        console.warn('[AudioStream] WebSocket close failed', e)
+      }
       audioWs = null
     }
   }

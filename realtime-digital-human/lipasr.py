@@ -1,4 +1,5 @@
 import numpy as np
+import queue
 from baseasr import BaseASR
 from wav2lip256 import audio
 
@@ -10,7 +11,7 @@ class LipASR(BaseASR):
         for _ in range(self.batch_size * 2):
             frame, type = self.get_audio_frame()
             self.frames.append(frame)
-            self.output_queue.put((frame, type))
+            self._put_drop_oldest(self.output_queue, (frame, type))
 
         # 上下文不足时不运行
         if len(self.frames) <= self.stride_left_size + self.stride_right_size:
@@ -33,8 +34,30 @@ class LipASR(BaseASR):
             else:
                 mel_chunks.append(mel[:, start_idx:start_idx + mel_step_size])
             i += 1
-        self.feat_queue.put(mel_chunks)
+        self._put_drop_oldest(self.feat_queue, mel_chunks)
 
         # 丢弃旧数据以节省内存
         self.frames = self.frames[-(self.stride_left_size +
                                     self.stride_right_size):]
+
+    def _put_drop_oldest(self, target_queue, item):
+        try:
+            target_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        except Exception:
+            try:
+                target_queue.put(item, block=False)
+                return
+            except Exception:
+                pass
+
+        try:
+            target_queue.get_nowait()
+        except Exception:
+            pass
+        try:
+            target_queue.put_nowait(item)
+        except Exception:
+            pass

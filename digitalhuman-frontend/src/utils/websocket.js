@@ -21,6 +21,7 @@ export class WebSocketManager {
     this.ws = null;
     this.heartbeatTimer = null;
     this.heartbeatTimeoutTimer = null;
+    this.reconnectTimer = null;
     this.reconnectAttempts = 0;
     this.isManualClose = false;
   }
@@ -30,6 +31,9 @@ export class WebSocketManager {
    */
   connect() {
     try {
+      if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+        return;
+      }
       this.ws = new WebSocket(this.url);
       this.isManualClose = false;
 
@@ -177,11 +181,20 @@ export class WebSocketManager {
     console.log(`尝试重新连接WebSocket... (${this.reconnectAttempts}/${this.options.maxReconnectAttempts})`);
 
     this.stopHeartbeat();
+    this.stopReconnectTimer();
 
-    setTimeout(() => {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.options.onReconnect(this.reconnectAttempts);
       this.connect();
     }, this.options.reconnectDelay);
+  }
+
+  stopReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
   }
 
   /**
@@ -190,9 +203,14 @@ export class WebSocketManager {
   close() {
     this.isManualClose = true;
     this.stopHeartbeat();
+    this.stopReconnectTimer();
 
     if (this.ws) {
-      this.ws.close();
+      try {
+        this.ws.close();
+      } catch (error) {
+        console.warn('WebSocket关闭失败:', error);
+      }
       this.ws = null;
     }
   }

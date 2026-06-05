@@ -4,7 +4,7 @@ import os
 import re
 import time
 import uuid
-from typing import Callable
+from typing import Callable, Optional
 
 from loguru import logger
 
@@ -52,10 +52,14 @@ def _extract_answer(data) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _make_tts_sender(nerfreal: BaseReal) -> tuple[Callable[[str], None], Callable[[], None]]:
+def _make_tts_sender(
+    nerfreal: BaseReal,
+    trace_id: Optional[str] = None,
+) -> tuple[Callable[[str], None], Callable[[], None]]:
     tts = getattr(nerfreal, "tts", None)
     direct_tts = env_bool("GONGAN_DIRECT_TTS", True)
     stream = None
+    segment_index = 0
 
     if direct_tts and hasattr(tts, "start_text_stream"):
         try:
@@ -66,34 +70,55 @@ def _make_tts_sender(nerfreal: BaseReal) -> tuple[Callable[[str], None], Callabl
             stream = None
 
     def send(text: str) -> None:
+        nonlocal segment_index
         clean_text = text.strip()
         if not clean_text:
             return
+        segment_index += 1
+        is_active = getattr(nerfreal, "is_active_chat_trace", None)
+        if trace_id and callable(is_active) and not is_active(trace_id):
+            logger.info(
+                f"Skip stale Gongan TTS segment trace_id={trace_id}, "
+                f"segment_index={segment_index}, len={len(clean_text)}"
+            )
+            return
         if stream is not None:
+            if hasattr(nerfreal, "set_active_tts_trace"):
+                nerfreal.set_active_tts_trace(trace_id, segment_index)
             stream.send_text(clean_text)
         else:
-            nerfreal.put_msg_txt(clean_text)
+            nerfreal.put_msg_txt(
+                clean_text,
+                trace_id=trace_id,
+                segment_index=segment_index,
+            )
 
     def finish() -> None:
         if stream is not None:
             stream.finish()
+        if hasattr(nerfreal, "clear_active_tts_trace"):
+            nerfreal.clear_active_tts_trace()
 
     return send, finish
 
 
 def llm_response(
-    message: str, nerfreal: BaseReal, sessionid: str, result_queue: asyncio.Queue
+    message: str,
+    nerfreal: BaseReal,
+    sessionid: str,
+    result_queue: asyncio.Queue,
+    trace_id: Optional[str] = None,
 ) -> str:
     start_time = time.perf_counter()
     first_token_received = False
-    msg_id = str(uuid.uuid4())
+    msg_id = trace_id or str(uuid.uuid4())
     client = get_gongan_client()
     complete_response: list[str] = []
     tts_buffer = ""
     min_segment_len = int(os.environ.get("GONGAN_TTS_MIN_SEGMENT_LEN", "12"))
     max_segment_len = int(os.environ.get("GONGAN_TTS_MAX_SEGMENT_LEN", "80"))
     read_timeout = env_float("GONGAN_LLM_READ_TIMEOUT", 60.0)
-    send_tts, finish_tts = _make_tts_sender(nerfreal)
+    send_tts, finish_tts = _make_tts_sender(nerfreal, trace_id=trace_id)
 
     def queue_tts(text: str) -> None:
         logger.info(f"Gongan TTS segment queued: {text[:30]!r}, len={len(text)}")
@@ -127,6 +152,10 @@ def llm_response(
         response.raise_for_status()
 
         for raw_line in response.iter_lines(decode_unicode=True):
+            is_active = getattr(nerfreal, "is_active_chat_trace", None)
+            if trace_id and callable(is_active) and not is_active(trace_id):
+                logger.info(f"停止处理已失效的公安LLM响应 trace_id={trace_id}")
+                return None
             if not raw_line:
                 continue
             if isinstance(raw_line, bytes):
