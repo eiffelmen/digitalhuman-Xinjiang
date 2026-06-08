@@ -498,7 +498,13 @@ class LipReal(BaseReal):
         self._next_render_linear_index = 0
         self._last_render_linear_index = None
         self._last_render_avatar_index = None
-        self.video_queue_max = int(os.getenv("WEBRTC_VIDEO_QUEUE_MAX", "3") or 3)
+        self.video_queue_max = int(
+            os.getenv(
+                "WEBRTC_VIDEO_BACKPRESSURE_FRAMES",
+                os.getenv("WEBRTC_VIDEO_QUEUE_MAX", "3"),
+            )
+            or 3
+        )
         self.sync_speech_start_index = os.getenv(
             "WAV2LIP_SYNC_SPEECH_START_INDEX", "1"
         ).lower() not in {"0", "false", "no"}
@@ -524,7 +530,7 @@ class LipReal(BaseReal):
         self._render_bg_img = None
         logger.info(
             "WebRTC output config: "
-            f"queue_max={self.video_queue_max}, "
+            f"queue_backpressure_frames={self.video_queue_max}, "
             f"sync_speech_start_index={self.sync_speech_start_index}, "
             f"speech_start_bridge_frames={self.speech_start_bridge_frames}, "
             f"clear_tracks_on_speech={self.clear_tracks_on_speech}, "
@@ -970,7 +976,7 @@ class LipReal(BaseReal):
 
         while not quit_event.is_set():
             # 视频队列是最终画面帧率的关键，避免音频短时缓冲把视频生产一起卡住。
-            if video_track is not None and video_track._queue.qsize() > self.video_queue_max:
+            if video_track is not None and video_track._queue.qsize() >= self.video_queue_max:
                 time.sleep(0.005)
                 continue
 

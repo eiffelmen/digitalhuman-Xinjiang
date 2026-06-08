@@ -33,6 +33,7 @@ def _env_float(name: str, default: float) -> float:
 
 WEBRTC_AUDIO_QUEUE_MAX = _env_int("WEBRTC_AUDIO_QUEUE_MAX", 50)
 WEBRTC_VIDEO_QUEUE_MAX = _env_int("WEBRTC_VIDEO_QUEUE_MAX", 6)
+WEBRTC_VIDEO_KEEP_FRAMES = _env_int("WEBRTC_VIDEO_KEEP_FRAMES", 4)
 WEBRTC_DROP_LOG_INTERVAL = _env_float("WEBRTC_DROP_LOG_INTERVAL", 5.0)
 WEBRTC_VIDEO_LAG_RESET_S = _env_float("WEBRTC_VIDEO_LAG_RESET_S", 0.12)
 
@@ -78,8 +79,13 @@ class PlayerStreamTrack(MediaStreamTrack):
 
         dropped = 0
         if self.kind == "video":
-            # 视频只保留极少量新帧。网络或浏览器慢时，宁可丢旧帧也不累积延迟。
-            while self._queue.qsize() > 1:
+            # 保留少量视频缓冲，让浏览器 jitter buffer 有连续帧可播放。
+            # 队列满时仍会丢旧帧，避免长时间累积延迟。
+            keep_frames = min(
+                max(1, WEBRTC_VIDEO_KEEP_FRAMES),
+                max(1, self._queue.maxsize - 1),
+            )
+            while self._queue.qsize() > keep_frames:
                 if self._drop_oldest_frame():
                     dropped += 1
                 else:
