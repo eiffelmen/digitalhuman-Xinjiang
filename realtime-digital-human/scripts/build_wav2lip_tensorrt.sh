@@ -12,11 +12,6 @@ MAX_BATCH="${MAX_BATCH:-16}"
 WORKSPACE_MIB="${WORKSPACE_MIB:-2048}"
 PRECISION="${PRECISION:-fp16}"
 
-if ! command -v trtexec >/dev/null 2>&1; then
-    echo "[ERROR] trtexec not found. Install TensorRT on the Ubuntu GPU server first." >&2
-    exit 1
-fi
-
 if [ ! -f "$ONNX_PATH" ]; then
     echo "[ERROR] ONNX file not found: $ONNX_PATH" >&2
     echo "Run: python scripts/export_wav2lip_onnx.py --output $ONNX_PATH" >&2
@@ -37,6 +32,19 @@ echo ">>> Building TensorRT engine"
 echo "ONNX:   $ONNX_PATH"
 echo "Engine: $ENGINE_PATH"
 echo "Shapes: min=$MIN_BATCH opt=$OPT_BATCH max=$MAX_BATCH model_size=$MODEL_SIZE"
+
+if ! command -v trtexec >/dev/null 2>&1; then
+    echo ">>> trtexec not found; falling back to TensorRT Python API"
+    exec python scripts/build_wav2lip_tensorrt_py.py \
+        --onnx "$ONNX_PATH" \
+        --engine "$ENGINE_PATH" \
+        --model-size "$MODEL_SIZE" \
+        --min-batch "$MIN_BATCH" \
+        --opt-batch "$OPT_BATCH" \
+        --max-batch "$MAX_BATCH" \
+        --workspace-mib "$WORKSPACE_MIB" \
+        --precision "$PRECISION"
+fi
 
 trtexec \
     --onnx="$ONNX_PATH" \
