@@ -20,8 +20,11 @@ def parse_args():
 
 
 def _create_network(builder, trt):
-    flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    return builder.create_network(flag)
+    flags = 0
+    explicit_batch = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
+    if explicit_batch is not None:
+        flags |= 1 << int(explicit_batch)
+    return builder.create_network(flags)
 
 
 def _set_workspace(config, trt, workspace_mib):
