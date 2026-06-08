@@ -2,7 +2,7 @@
 
 This is the cleaned source package for the Xinjiang digital human project.
 
-Large model and avatar assets are not stored in GitHub. Download the runtime assets from Baidu Netdisk and restore them before running the backend.
+The Wav2Lip source code is stored in GitHub. Large model weights and avatar assets are not stored in GitHub. Download the runtime assets from Baidu Netdisk and restore them before running the backend.
 
 ## Runtime Assets
 
@@ -13,6 +13,8 @@ Large model and avatar assets are not stored in GitHub. Download the runtime ass
 
 After restoring the assets, the backend should contain:
 
+- `realtime-digital-human/wav2lip256/audio.py`
+- `realtime-digital-human/wav2lip256/models/wav2lip.py`
 - `realtime-digital-human/wav2lip256/wav2lip.pth`
 - `realtime-digital-human/data/avatars/wav2lip_avatar11/`
 - `realtime-digital-human/data/ref_audios/`

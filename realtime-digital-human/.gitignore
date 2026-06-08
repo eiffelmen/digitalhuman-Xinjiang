@@ -26,7 +26,6 @@ ragdb/
 gguf/*.gguf
 
 wav2lip/
-wav2lip256/
 storage/
 storage.*/
 config.toml

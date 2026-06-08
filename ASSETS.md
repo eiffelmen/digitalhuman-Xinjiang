@@ -1,6 +1,6 @@
 # Runtime Assets
 
-The repository intentionally excludes large runtime assets. Restore them after cloning the project.
+The repository includes the Wav2Lip source code under `realtime-digital-human/wav2lip256/`. It intentionally excludes large runtime assets. Restore them after cloning the project.
 
 ## Required
 
