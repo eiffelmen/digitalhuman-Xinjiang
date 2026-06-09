@@ -69,8 +69,14 @@ def build_engine(args):
 
     if args.precision == "fp16":
         has_fast_fp16 = getattr(builder, "platform_has_fast_fp16", True)
-        if has_fast_fp16:
-            config.set_flag(trt.BuilderFlag.FP16)
+        fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
+        if fp16_flag is None:
+            print(
+                ">>> WARNING: This TensorRT Python API has no BuilderFlag.FP16; "
+                "building with TensorRT default precision."
+            )
+        elif has_fast_fp16:
+            config.set_flag(fp16_flag)
         else:
             print(">>> WARNING: GPU does not report fast FP16; building without FP16 flag.")
 
