@@ -68,7 +68,8 @@ def build_engine(args):
     _set_workspace(config, trt, args.workspace_mib)
 
     if args.precision == "fp16":
-        if builder.platform_has_fast_fp16:
+        has_fast_fp16 = getattr(builder, "platform_has_fast_fp16", True)
+        if has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
         else:
             print(">>> WARNING: GPU does not report fast FP16; building without FP16 flag.")
