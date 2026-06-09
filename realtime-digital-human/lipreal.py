@@ -52,6 +52,13 @@ def _sync_device():
         torch.cuda.synchronize()
 
 
+def _env_float(name, default):
+    try:
+        return max(0.1, float(os.getenv(name, default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
 log_perf("wav2lip", "device", device=device, device_name=_device_name())
 
 
@@ -517,6 +524,11 @@ class LipReal(BaseReal):
         self.video_max_width = int(os.getenv("WEBRTC_VIDEO_MAX_WIDTH", "540") or 0)
         self.video_max_height = int(os.getenv("WEBRTC_VIDEO_MAX_HEIGHT", "960") or 0)
         self.video_scale = float(os.getenv("WEBRTC_VIDEO_SCALE", "1.0") or 1.0)
+        self.render_fps = _env_float(
+            "WEBRTC_RENDER_FPS",
+            _env_float("WEBRTC_VIDEO_FPS", 25.0),
+        )
+        self.render_frame_interval = 1.0 / self.render_fps
         self.render_cache_size = int(os.getenv("WEBRTC_RENDER_CACHE_SIZE", "1024") or 0)
         self.render_preload = os.getenv("WEBRTC_RENDER_PRELOAD", "1").lower() not in {
             "0",
@@ -537,6 +549,7 @@ class LipReal(BaseReal):
             f"max_width={self.video_max_width}, "
             f"max_height={self.video_max_height}, "
             f"scale={self.video_scale}, "
+            f"render_fps={self.render_fps:.2f}, "
             f"render_cache_size={self.render_cache_size}, "
             f"render_preload={self.render_preload}"
         )
@@ -973,6 +986,7 @@ class LipReal(BaseReal):
         render_count = 0
         render_speaking_count = 0
         render_idle_count = 0
+        next_render_time = time.perf_counter()
 
         while not quit_event.is_set():
             # 视频队列是最终画面帧率的关键，避免音频短时缓冲把视频生产一起卡住。
@@ -1139,6 +1153,14 @@ class LipReal(BaseReal):
                 render_count = 0
                 render_speaking_count = 0
                 render_idle_count = 0
+
+            if self.render_frame_interval > 0:
+                next_render_time += self.render_frame_interval
+                sleep_s = next_render_time - time.perf_counter()
+                if sleep_s > 0:
+                    time.sleep(min(sleep_s, self.render_frame_interval))
+                elif sleep_s < -self.render_frame_interval * 2:
+                    next_render_time = time.perf_counter()
 
         logger.info('Wav2Lip 处理帧线程停止...')
 

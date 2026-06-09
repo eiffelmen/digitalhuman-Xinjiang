@@ -9,9 +9,18 @@ import fractions
 from loguru import logger
 from aiortc import MediaStreamTrack
 
+
+def _env_video_fps(default: float = 25.0) -> float:
+    try:
+        return max(1.0, float(os.environ.get("WEBRTC_VIDEO_FPS", default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
 AUDIO_PTIME = 0.020  # 20ms audio packetization
 VIDEO_CLOCK_RATE = 90000  # 视频系统中的采样率
-VIDEO_PTIME = 1 / 25
+WEBRTC_VIDEO_FPS = _env_video_fps()
+VIDEO_PTIME = 1 / WEBRTC_VIDEO_FPS
 VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
 SAMPLE_RATE = 16000
 AUDIO_TIME_BASE = fractions.Fraction(1, SAMPLE_RATE)
