@@ -1326,7 +1326,17 @@ async def run(push_url, sessionid, state: AppState):
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
+    try:
+        current_start_method = mp.get_start_method(allow_none=True)
+        if current_start_method is None:
+            mp.set_start_method("spawn")
+            logger.info("multiprocessing start_method set to spawn")
+        else:
+            logger.info(
+                f"multiprocessing start_method already set: {current_start_method}"
+            )
+    except RuntimeError as exc:
+        logger.warning(f"multiprocessing start_method setup skipped: {exc}")
     parser = argparse.ArgumentParser(description="Realtime Digital Human 应用参数说明")
     parser.add_argument("--fps", type=int, default=50, help="音频每秒帧数")
     parser.add_argument("-l", type=int, default=10, help="滑动窗口左侧长度，单位20ms")
