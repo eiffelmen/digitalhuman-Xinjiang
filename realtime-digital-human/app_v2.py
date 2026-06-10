@@ -1253,6 +1253,7 @@ async def audio_ws_handler(request: web.Request) -> web.StreamResponse:
             f"[PIPELINE] audio_ws_closed session={sessionid} "
             f"frames={frames} bytes={total_bytes} "
             f"duration_ms={elapsed_ms(connect_mono):.2f} "
+            f"close_code={getattr(ws, 'close_code', None)} "
             f"exception={ws.exception()}"
         )
 

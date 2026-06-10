@@ -8,6 +8,14 @@ const parsedAudioMetricsInterval = Number(import.meta.env.VITE_AUDIO_STREAM_METR
 const AUDIO_STREAM_METRICS_INTERVAL_MS = Number.isFinite(parsedAudioMetricsInterval)
   ? Math.max(3000, parsedAudioMetricsInterval)
   : 10000
+const parsedAudioWsReconnectBase = Number(import.meta.env.VITE_AUDIO_WS_RECONNECT_BASE_MS || 500)
+const AUDIO_WS_RECONNECT_BASE_MS = Number.isFinite(parsedAudioWsReconnectBase)
+  ? Math.max(200, parsedAudioWsReconnectBase)
+  : 500
+const parsedAudioWsReconnectMax = Number(import.meta.env.VITE_AUDIO_WS_RECONNECT_MAX_MS || 5000)
+const AUDIO_WS_RECONNECT_MAX_MS = Number.isFinite(parsedAudioWsReconnectMax)
+  ? Math.max(AUDIO_WS_RECONNECT_BASE_MS, parsedAudioWsReconnectMax)
+  : 5000
 
 async function callInterrupt(sessionId) {
   try {
@@ -28,6 +36,8 @@ export function useAudioStream(sessionId) {
   let interruptCooling = false  // 防止重复触发打断
   let interruptCoolingTimer = null
   let metricsTimer = null
+  let reconnectTimer = null
+  let reconnectAttempts = 0
   let chunksSent = 0
   let bytesSent = 0
   let droppedBuffered = 0
@@ -55,26 +65,69 @@ export function useAudioStream(sessionId) {
     })
   }
 
+  function scheduleAudioWsReconnect(reason) {
+    if (!started || reconnectTimer) return
+    const delay = Math.min(
+      AUDIO_WS_RECONNECT_MAX_MS,
+      AUDIO_WS_RECONNECT_BASE_MS * (2 ** Math.min(reconnectAttempts, 4)),
+    )
+    reconnectAttempts += 1
+    reportAudioMetric('audio_ws_reconnect_scheduled', {
+      reason,
+      reconnectAttempts,
+      delay,
+    })
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      connectAudioWs(`reconnect:${reason}`)
+    }, delay)
+  }
+
+  function connectAudioWs(reason = 'start') {
+    if (!started) return
+    if (
+      audioWs &&
+      (audioWs.readyState === WebSocket.OPEN || audioWs.readyState === WebSocket.CONNECTING)
+    ) {
+      return
+    }
+    const wsPath = `/ws-audio/${sessionId}`
+    const url = buildWsUrl('backend', wsPath)
+    const ws = new WebSocket(url)
+    audioWs = ws
+    ws.binaryType = 'arraybuffer'
+
+    ws.addEventListener('error', (e) => {
+      console.error('[AudioStream] WebSocket error', e)
+      reportAudioMetric('audio_ws_error', { errorType: e?.type, reason })
+    })
+    ws.addEventListener('close', (event) => {
+      console.log('[AudioStream] WebSocket closed', event.code, event.reason)
+      reportAudioMetric('audio_ws_close', {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+        connectReason: reason,
+        shouldReconnect: started,
+      })
+      if (audioWs === ws) {
+        audioWs = null
+      }
+      if (started) {
+        scheduleAudioWsReconnect(`close:${event.code || 'unknown'}`)
+      }
+    })
+    ws.addEventListener('open', () => {
+      reconnectAttempts = 0
+      reportAudioMetric('audio_ws_open', { reason })
+    })
+  }
+
   function start() {
     if (started) return
     started = true
-
-    const wsPath = `/ws-audio/${sessionId}`
-    const url = buildWsUrl('backend', wsPath)
-    audioWs = new WebSocket(url)
-    audioWs.binaryType = 'arraybuffer'
-
-    audioWs.addEventListener('error', (e) => {
-      console.error('[AudioStream] WebSocket error', e)
-      reportAudioMetric('audio_ws_error', { errorType: e?.type })
-    })
-    audioWs.addEventListener('close', () => {
-      console.log('[AudioStream] WebSocket closed')
-      reportAudioMetric('audio_ws_close')
-    })
-    audioWs.addEventListener('open', () => {
-      reportAudioMetric('audio_ws_open')
-    })
+    reportAudioMetric('audio_stream_start')
+    connectAudioWs('start')
 
     metricsTimer = setInterval(() => {
       reportAudioMetric('audio_stream_metrics')
@@ -95,6 +148,14 @@ export function useAudioStream(sessionId) {
         maxPowerLevel = Math.max(maxPowerLevel, powerLevel || 0)
         if (!started || !audioWs || audioWs.readyState !== WebSocket.OPEN) {
           droppedNotOpen += 1
+          if (
+            started &&
+            (!audioWs ||
+              audioWs.readyState === WebSocket.CLOSING ||
+              audioWs.readyState === WebSocket.CLOSED)
+          ) {
+            scheduleAudioWsReconnect('audio_process_without_open_ws')
+          }
           return
         }
         if (audioWs.bufferedAmount > MAX_BUFFERED_BYTES) {
@@ -144,6 +205,10 @@ export function useAudioStream(sessionId) {
           isUserNotAllow ? '用户拒绝麦克风权限' : msg,
         )
         reportAudioMetric('audio_recorder_open_failed', { message: msg, isUserNotAllow })
+        if (audioWs) {
+          audioWs.close()
+          audioWs = null
+        }
         if (metricsTimer) {
           clearInterval(metricsTimer)
           metricsTimer = null
@@ -156,6 +221,10 @@ export function useAudioStream(sessionId) {
   function stop() {
     started = false
     interruptCooling = false
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
     if (interruptCoolingTimer) {
       clearTimeout(interruptCoolingTimer)
       interruptCoolingTimer = null
