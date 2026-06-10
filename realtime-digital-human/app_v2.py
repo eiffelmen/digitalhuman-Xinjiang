@@ -1194,11 +1194,23 @@ async def audio_ws_handler(request: web.Request) -> web.StreamResponse:
     state = request.app["state"]
 
     if sessionid not in state.nerfreals:
+        logger.warning(
+            f"[PIPELINE] audio_ws_reject session={sessionid} "
+            f"remote={request.remote} reason=session_not_found"
+        )
         return web.Response(status=404, text="Session not found")
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    logger.info(f"Audio WebSocket connected, session={sessionid}")
+    connect_mono = now()
+    frames = 0
+    total_bytes = 0
+    first_binary_logged = False
+    last_metrics_mono = connect_mono
+    logger.info(
+        f"[PIPELINE] audio_ws_connected session={sessionid} "
+        f"remote={request.remote}"
+    )
 
     handler = ASRSessionHandler(
         session_id=sessionid, state=state, ws=state.sessionid_ws.get(sessionid)
@@ -1206,12 +1218,43 @@ async def audio_ws_handler(request: web.Request) -> web.StreamResponse:
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.BINARY:
+                frames += 1
+                total_bytes += len(msg.data)
+                current = now()
+                if not first_binary_logged:
+                    first_binary_logged = True
+                    logger.info(
+                        f"[PIPELINE] audio_ws_first_binary session={sessionid} "
+                        f"bytes={len(msg.data)} elapsed_ms={elapsed_ms(connect_mono):.2f}"
+                    )
+                if frames <= 3 or current - last_metrics_mono >= 5.0:
+                    last_metrics_mono = current
+                    logger.debug(
+                        f"[PIPELINE] audio_ws_recv_metrics session={sessionid} "
+                        f"frames={frames} bytes={total_bytes} "
+                        f"last_frame_bytes={len(msg.data)} "
+                        f"elapsed_ms={elapsed_ms(connect_mono):.2f}"
+                    )
                 await handler.on_audio_chunk(msg.data)
+            elif msg.type == web.WSMsgType.TEXT:
+                logger.debug(
+                    f"[PIPELINE] audio_ws_text session={sessionid} "
+                    f"data={msg.data[:120]!r}"
+                )
             elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                logger.warning(
+                    f"[PIPELINE] audio_ws_close_msg session={sessionid} "
+                    f"type={msg.type} exception={ws.exception()}"
+                )
                 break
     finally:
         await handler.close()
-        logger.info(f"Audio WebSocket closed, session={sessionid}")
+        logger.info(
+            f"[PIPELINE] audio_ws_closed session={sessionid} "
+            f"frames={frames} bytes={total_bytes} "
+            f"duration_ms={elapsed_ms(connect_mono):.2f} "
+            f"exception={ws.exception()}"
+        )
 
     return ws
 
@@ -1490,6 +1533,7 @@ if __name__ == "__main__":
     # aiohttp WebSocket 路由
     appasync.router.add_get("/ws/{sessionid}", ws_handler)
     appasync.router.add_get("/ws-audio/{sessionid}", audio_ws_handler)
+    appasync.router.add_get("/humanaudio/{sessionid}", audio_ws_handler)
 
     appasync.router.add_post("/update_config", update_config)
 

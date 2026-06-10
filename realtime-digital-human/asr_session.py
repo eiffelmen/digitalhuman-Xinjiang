@@ -46,6 +46,13 @@ class ASRSessionHandler:
         self._audio_bytes_sent = 0
         self._prebuffer_frames = 0
         self._provider_name = os.environ.get("ASR_PROVIDER", "gongan")
+        self._audio_chunks_received = 0
+        self._audio_bytes_received = 0
+        self._audio_chunks_skipped_speaking = 0
+        self._audio_bytes_skipped_speaking = 0
+        self._last_audio_diag_mono = 0.0
+        self._last_speaking_skip_diag_mono = 0.0
+        self._had_speaking_skip = False
         self._vad = AudioVAD(
             on_speech_start=self._on_speech_start,
             on_speech_end=self._on_speech_end,
@@ -54,10 +61,48 @@ class ASRSessionHandler:
         )
 
     async def on_audio_chunk(self, pcm: bytes) -> None:
+        self._audio_chunks_received += 1
+        self._audio_bytes_received += len(pcm)
+        current = now()
         # 数字人正在说话时，跳过 VAD 处理，防止麦克风拾取数字人自身声音导致反馈循环
         nerfreal = self._state.nerfreals.get(self._session_id)
         if nerfreal and getattr(nerfreal, 'speaking', False):
+            self._audio_chunks_skipped_speaking += 1
+            self._audio_bytes_skipped_speaking += len(pcm)
+            self._had_speaking_skip = True
+            should_log = (
+                self._audio_chunks_skipped_speaking <= 3
+                or current - self._last_speaking_skip_diag_mono >= 5.0
+            )
+            if should_log:
+                self._last_speaking_skip_diag_mono = current
+                logger.warning(
+                    f"[PIPELINE] audio_chunk_skipped_while_avatar_speaking "
+                    f"session={self._session_id} "
+                    f"received_chunks={self._audio_chunks_received} "
+                    f"received_bytes={self._audio_bytes_received} "
+                    f"skipped_chunks={self._audio_chunks_skipped_speaking} "
+                    f"skipped_bytes={self._audio_bytes_skipped_speaking}"
+                )
             return
+        if self._had_speaking_skip:
+            self._had_speaking_skip = False
+            logger.info(
+                f"[PIPELINE] audio_chunk_resumed_to_vad session={self._session_id} "
+                f"received_chunks={self._audio_chunks_received} "
+                f"skipped_while_speaking={self._audio_chunks_skipped_speaking}"
+            )
+        if (
+            self._audio_chunks_received <= 3
+            or current - self._last_audio_diag_mono >= 5.0
+        ):
+            self._last_audio_diag_mono = current
+            logger.debug(
+                f"[PIPELINE] audio_chunk_to_vad session={self._session_id} "
+                f"chunks={self._audio_chunks_received} "
+                f"bytes={self._audio_bytes_received} "
+                f"chunk_bytes={len(pcm)}"
+            )
         await self._vad.process_chunk(pcm)
 
     async def _on_speech_start(self, pre_buffer: list[bytes]) -> None:
@@ -309,6 +354,13 @@ class ASRSessionHandler:
             )
 
     async def close(self) -> None:
+        logger.info(
+            f"[PIPELINE] audio_asr_handler_close session={self._session_id} "
+            f"received_chunks={self._audio_chunks_received} "
+            f"received_bytes={self._audio_bytes_received} "
+            f"skipped_while_speaking={self._audio_chunks_skipped_speaking} "
+            f"skipped_bytes={self._audio_bytes_skipped_speaking}"
+        )
         if self._provider:
             await self._provider.close()
             self._provider = None
