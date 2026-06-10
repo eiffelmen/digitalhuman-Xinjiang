@@ -321,6 +321,11 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
         ready_event.set()
 
         last_mel_batch = None
+        _inf_count = 0
+        _inf_idle_count = 0
+        _inf_silence_count = 0
+        _inf_real_count = 0
+        _inf_audio_miss_count = 0
         while not quit_event.is_set():
             if reset_event is not None and reset_event.is_set():
                 last_mel_batch = None
@@ -332,6 +337,7 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                 fast_speech_event is not None and fast_speech_event.is_set()
             )
 
+            _inf_count += 1
             if last_mel_batch is None:
                 try:
                     # 恢复超时时间为 0.04s，匹配 Batch 16 的节奏
@@ -341,6 +347,13 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                         time.sleep(0.001)
                         continue
                     # 队列为空，推送一帧待机帧以维持 WebRTC 心跳
+                    _inf_idle_count += 1
+                    if _inf_idle_count <= 3 or _inf_idle_count % 250 == 0:
+                        logger.debug(
+                            f"[AUDIO_DIAG] inference #{_inf_count}: feat_queue EMPTY → idle frame "
+                            f"idle_total={_inf_idle_count} out_queue={audio_out_queue.qsize()} "
+                            f"res_queue={res_frame_queue.qsize()}"
+                        )
                     res_frame_queue.put(
                         (None, __mirror_index(length, index), None, index)
                     )
@@ -366,6 +379,16 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                 # 原始音频还没准备好（TTS传输中或ASR计算中）
                 # 此时不能丢弃 mel_batch，存起来下次循环再试，本次先发待机帧
                 last_mel_batch = mel_batch
+                _inf_audio_miss_count += 1
+                got = len(audio_frames)
+                if _inf_audio_miss_count <= 5 or _inf_audio_miss_count % 250 == 0:
+                    logger.debug(
+                        f"[AUDIO_DIAG] inference #{_inf_count}: audio MISS "
+                        f"need={current_batch_size * 2} got={got} "
+                        f"mel_batch_size={current_batch_size} "
+                        f"out_queue={audio_out_queue.qsize()} "
+                        f"miss_total={_inf_audio_miss_count}"
+                    )
                 if fast_first_pending:
                     time.sleep(0.001)
                     continue
@@ -376,11 +399,25 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                 continue
 
             if is_all_silence:
+                _inf_silence_count += 1
+                if _inf_silence_count <= 3 or _inf_silence_count % 250 == 0:
+                    logger.debug(
+                        f"[AUDIO_DIAG] inference #{_inf_count}: SILENCE batch={current_batch_size} "
+                        f"silence_total={_inf_silence_count} real_total={_inf_real_count} "
+                        f"feat_queue={audio_feat_queue.qsize()} out_queue={audio_out_queue.qsize()}"
+                    )
                 for i in range(current_batch_size):
                     res_frame_queue.put((None, __mirror_index(length, index),
                                          audio_frames[i * 2:i * 2 + 2], index))
                     index += 1
             else:
+                _inf_real_count += 1
+                logger.debug(
+                    f"[AUDIO_DIAG] inference #{_inf_count}: REAL batch={current_batch_size} "
+                    f"real_total={_inf_real_count} silence_total={_inf_silence_count} "
+                    f"audio_miss_total={_inf_audio_miss_count} "
+                    f"feat_queue={audio_feat_queue.qsize()} out_queue={audio_out_queue.qsize()}"
+                )
                 if fast_first_pending:
                     start_index = _consume_latest_queue_value(
                         speech_start_index_queue
@@ -587,19 +624,20 @@ class LipReal(BaseReal):
                   self.face_list_cycle, self.asr.feat_queue,
                   self.asr.output_queue, self.res_frame_queue, self.model,
                   self.inference_ready, self.inference_reset_event,
-                  self.fast_speech_event, self.speech_start_index_queue))
+                  self.fast_speech_event, self.speech_start_index_queue),
+            daemon=True)
         self.inference_thread.start()
         self.inference_ready.wait(timeout=5.0)  # 添加超时以防止死锁
 
-    def _drain_queue(self, target_queue):
-        cleared = 0
-        while True:
-            try:
-                target_queue.get_nowait()
-                cleared += 1
-            except Exception:
-                break
-        return cleared
+    def _drain_queue(self, q):
+        size = 0
+        try:
+            while True:
+                q.get_nowait()
+                size += 1
+        except Exception:
+            pass
+        return size
 
     def _clear_frame_queue(self):
         return self._drain_queue(self.res_frame_queue)
@@ -710,17 +748,18 @@ class LipReal(BaseReal):
             "no",
         }
         if not enabled or self.speaking:
+            logger.info(f"LipReal._prepare_first_audio_frame: skipping (enabled={enabled}, speaking={self.speaking})")
             return
 
+        logger.info("LipReal._prepare_first_audio_frame: not speaking, clearing queues for fast first frame")
         start = now()
         first_batch_size = int(os.getenv("WAV2LIP_FIRST_BATCH_SIZE", "4") or 4)
         first_batch_size = max(1, min(first_batch_size, self.batch_size))
 
+        # 不清空 asr.queue：保留 TTS 已推送的音频帧，避免吞掉开头的语音。
+        # 只清空 output_queue 和 feat_queue：去掉暖机阶段的静音数据，
+        # 让推理线程尽快拿到真正的音频特征。
         input_size = self.asr.queue.qsize()
-        try:
-            self.asr.queue.queue.clear()
-        except Exception:
-            input_size = -1
         output_size = self._drain_queue(self.asr.output_queue)
         feat_size = self._drain_queue(self.asr.feat_queue)
         frame_size, retained_bridge_frames, last_retained_linear_index = (
@@ -987,9 +1026,13 @@ class LipReal(BaseReal):
         render_speaking_count = 0
         render_idle_count = 0
         next_render_time = time.perf_counter()
+        _render_audio_push = 0
+        _render_audio_silence = 0
+        _render_video_skip = 0
 
         while not quit_event.is_set():
-            # 视频队列是最终画面帧率的关键，避免音频短时缓冲把视频生产一起卡住。
+            # 视频队列背压：音视频必须同步推进，避免音画漂移。
+            # 视频队列已从 6 帧增大到 12 帧，背压触发频率大幅降低。
             if video_track is not None and video_track._queue.qsize() >= self.video_queue_max:
                 time.sleep(0.005)
                 continue
@@ -1069,6 +1112,19 @@ class LipReal(BaseReal):
 
             # 音画同步优化：优先推送音频包
             if audio_frames is not None:
+                _has_real_audio = any(t == 0 for _, t in audio_frames)
+                if _has_real_audio:
+                    _render_audio_push += 1
+                else:
+                    _render_audio_silence += 1
+                if _render_audio_push <= 5 or _render_audio_push % 250 == 0:
+                    logger.debug(
+                        f"[AUDIO_DIAG] render: real_audio={_render_audio_push} "
+                        f"silence={_render_audio_silence} video_skip={_render_video_skip} "
+                        f"speaking={self.speaking} idle={idle_frame} "
+                        f"vq={video_track._queue.qsize() if video_track else -1} "
+                        f"aq={audio_track._queue.qsize() if audio_track else -1}"
+                    )
                 for audio_frame in audio_frames:
                     frame, _ = audio_frame
                     frame = (frame * 32767).astype(np.int16)
@@ -1079,6 +1135,7 @@ class LipReal(BaseReal):
                     new_frame.sample_rate = 16000
                     self._put_track_frame(audio_track, new_frame, loop)
             else:
+                _render_audio_silence += 1
                 # 维持 40ms 的静音（20ms * 2）以匹配 25fps 的视频节奏
                 silence_frame = np.zeros(self.chunk, dtype=np.int16)
                 for _ in range(2):
@@ -1173,7 +1230,8 @@ class LipReal(BaseReal):
         self.init_customindex()
         process_thread = Thread(target=self.process_frames,
                                 args=(quit_event, loop, audio_track,
-                                      video_track))
+                                      video_track),
+                                daemon=True)
         process_thread.start()
 
         # 核心修复：将 ASR 运行移至独立线程。
@@ -1183,7 +1241,7 @@ class LipReal(BaseReal):
                 self.asr.run_step()
                 time.sleep(0.001)
 
-        asr_thread = Thread(target=asr_worker)
+        asr_thread = Thread(target=asr_worker, daemon=True)
         asr_thread.start()
 
         while not quit_event.is_set():

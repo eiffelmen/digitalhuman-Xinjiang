@@ -1103,14 +1103,15 @@ if __name__ == "__main__":
     def run_server(runner):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        _llm_consumer_task = None
 
         try:
             loop.run_until_complete(runner.setup())
             site = web.TCPSite(runner, "0.0.0.0", opt.listenport)
             loop.run_until_complete(site.start())
 
-            # 启动 LLM 响应消费者任务
-            loop.run_until_complete(asyncio.ensure_future(_llm_response_consumer(state)))
+            # 启动 LLM 响应消费者任务（后台任务，不阻塞事件循环）
+            _llm_consumer_task = asyncio.ensure_future(_llm_response_consumer(state))
 
             if opt.transport == "rtcpush":
                 for k in range(opt.max_session):
@@ -1129,6 +1130,14 @@ if __name__ == "__main__":
         finally:
             # 执行清理操作
             logger.info("正在清理资源...")
+
+            # 取消 LLM 消费者后台任务
+            if _llm_consumer_task is not None and not _llm_consumer_task.done():
+                _llm_consumer_task.cancel()
+                try:
+                    loop.run_until_complete(_llm_consumer_task)
+                except asyncio.CancelledError:
+                    pass
 
             # 关闭所有WebRTC连接
             if state.pcs:

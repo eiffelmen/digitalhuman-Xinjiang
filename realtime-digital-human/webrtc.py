@@ -41,10 +41,10 @@ def _env_float(name: str, default: float) -> float:
 
 
 WEBRTC_AUDIO_QUEUE_MAX = _env_int("WEBRTC_AUDIO_QUEUE_MAX", 50)
-WEBRTC_VIDEO_QUEUE_MAX = _env_int("WEBRTC_VIDEO_QUEUE_MAX", 6)
-WEBRTC_VIDEO_KEEP_FRAMES = _env_int("WEBRTC_VIDEO_KEEP_FRAMES", 4)
+WEBRTC_VIDEO_QUEUE_MAX = _env_int("WEBRTC_VIDEO_QUEUE_MAX", 12)
+WEBRTC_VIDEO_KEEP_FRAMES = _env_int("WEBRTC_VIDEO_KEEP_FRAMES", 8)
 WEBRTC_DROP_LOG_INTERVAL = _env_float("WEBRTC_DROP_LOG_INTERVAL", 5.0)
-WEBRTC_VIDEO_LAG_RESET_S = _env_float("WEBRTC_VIDEO_LAG_RESET_S", 0.12)
+WEBRTC_VIDEO_LAG_RESET_S = _env_float("WEBRTC_VIDEO_LAG_RESET_S", 0.20)
 
 
 class PlayerStreamTrack(MediaStreamTrack):
@@ -261,6 +261,7 @@ class HumanPlayer:
                 target=player_worker_thread,
                 args=(self.__thread_quit, asyncio.get_event_loop(),
                       self.__container, self.__audio, self.__video),
+                daemon=True,
             )
             self.__thread.start()
 

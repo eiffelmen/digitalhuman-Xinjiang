@@ -36,6 +36,7 @@ class BaseReal:
         self.sample_rate = 16000
         # 320 samples per chunk (20ms * 16000 / 1000)
         self.chunk = self.sample_rate // opt.fps
+        self._audio_push_count = 0
         # self.sessionid = self.opt.sessionid
 
         if opt.tts == "edgetts":
@@ -108,6 +109,7 @@ class BaseReal:
         return None
 
     def put_audio_frame(self, audio_chunk):  # 16khz 20ms pcm
+        self._audio_push_count += 1
         if not self._active_tts_first_audio_frame_logged:
             self._active_tts_first_audio_frame_logged = True
             self._pending_wav2lip_trace_id = self._active_tts_trace_id
@@ -130,6 +132,13 @@ class BaseReal:
             )
             self._prepare_first_audio_frame()
         self.asr.put_audio_frame(audio_chunk)
+        if self._audio_push_count <= 5 or self._audio_push_count % 100 == 0:
+            logger.debug(
+                f"[AUDIO_DIAG] TTS→ASR put_audio_frame #{self._audio_push_count} "
+                f"samples={len(audio_chunk)} asr_queue={self.asr.queue.qsize()} "
+                f"output_queue={self.asr.output_queue.qsize()} "
+                f"feat_queue={self.asr.feat_queue.qsize()}"
+            )
 
     def pause_talk(self):
         self.tts.flush_talk()

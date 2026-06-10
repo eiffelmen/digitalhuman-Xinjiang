@@ -8,10 +8,16 @@ class LipASR(BaseASR):
 
     def run_step(self):
         # 获取音频帧
+        real_count = 0
+        silence_count = 0
         for _ in range(self.batch_size * 2):
             frame, type = self.get_audio_frame()
             self.frames.append(frame)
             self._put_drop_oldest(self.output_queue, (frame, type))
+            if type == 0:
+                real_count += 1
+            else:
+                silence_count += 1
 
         # 上下文不足时不运行
         if len(self.frames) <= self.stride_left_size + self.stride_right_size:
@@ -19,6 +25,14 @@ class LipASR(BaseASR):
 
         inputs = np.concatenate(self.frames)  # [N * chunk]
         mel = audio.melspectrogram(inputs)
+
+        if real_count > 0:
+            logger.debug(
+                f"[AUDIO_DIAG] ASR run_step: real={real_count} silence={silence_count} "
+                f"frames_buf={len(self.frames)} mel_shape={mel.shape} "
+                f"asr_queue={self.queue.qsize()} out_queue={self.output_queue.qsize()} "
+                f"feat_queue={self.feat_queue.qsize()}"
+            )
         # 截取步长部分
         left = max(0, self.stride_left_size * 80 / 50)
         mel_idx_multiplier = 80. * 2 / self.fps
