@@ -136,3 +136,38 @@ What the diagnostics contain:
 - `[CLIENT_METRICS]`: browser-side video/audio element state, WebRTC ICE/connection state, inbound RTP stats, decoded/dropped video frame deltas, JS heap usage, page visibility, viewport, and audio capture/send counters.
 - `[SERVER_METRICS]`: backend process RSS/thread/file-descriptor snapshot, CUDA memory snapshot, active sessions, WebRTC peer connection states, per-session render queues, audio queues, TTS state, Wav2Lip frame queue, and track output queues.
 - Event logs: WebRTC offer/answer timing, track arrival, video `playing/waiting/stalled/error`, audio WebSocket lifecycle, microphone recorder lifecycle, and interrupt requests.
+
+## Response Latency And Lip-sync Diagnostics
+
+The backend also emits trace-level logs for each user request. Every request has a `trace_id`, which is carried through VAD, ASR, LLM, TTS, Wav2Lip, and WebRTC output.
+
+Use this when investigating:
+
+- Slow digital human response.
+- TTS audio being cut off or incomplete.
+- TTS audio and mouth movement not matching.
+
+After reproducing the issue, collect the focused pipeline log:
+
+```bash
+cd /home/dsd/wz/digitalhuman-Xinjiang/realtime-digital-human
+latest_log=$(ls -t logs/file_*.log | head -1)
+
+grep -E '\[PERF\]|\[时间点\]|\[AUDIO_DIAG\]|\[SYNC_DIAG\]|GonganTTS|Gongan LLM|ASR|VAD|queue dropped|track_recv' "$latest_log" \
+  > /tmp/digitalhuman-pipeline-diagnostics.log
+```
+
+Send `/tmp/digitalhuman-pipeline-diagnostics.log` plus the full latest backend log if possible.
+
+Important actions to compare by `trace_id`:
+
+- `vad speech_segment`: VAD speaking duration and trailing wait.
+- `asr provider_end_session`: ASR service latency and recognized text length.
+- `trace llm_first_token` / `trace llm_done`: LLM first-token and full-stream latency.
+- `trace tts_segment_dispatch`: LLM text segment entering TTS.
+- `trace tts_first_audio_packet` / `trace tts_first_audio_frame`: TTS first audio packet and first playable audio frame latency.
+- `tts stream_finish_wait`: whether streamed TTS finished normally or timed out before all audio arrived.
+- `tts pcm_flush`: total PCM packets, generated audio frames, padded tail frame, and audio duration.
+- `tts audio_frames_to_wav2lip`: number of 20 ms audio frames pushed into Wav2Lip.
+- `trace wav2lip_first_output_frame`: first mouth-frame output.
+- `webrtc track_recv_wait_slow` / `webrtc track_queue_drop`: WebRTC output wait or dropped frames.

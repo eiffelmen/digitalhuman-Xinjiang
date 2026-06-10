@@ -7,6 +7,7 @@ from typing import Callable, Awaitable
 import torch
 from silero_vad import load_silero_vad
 from loguru import logger
+from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 
 SAMPLE_RATE = 16000
 SILERO_CHUNK = 512          # silero 在 16kHz 时要求 512 样本/帧
@@ -47,6 +48,8 @@ class AudioVAD:
 
         self._trailing_start: float = 0.0
         self._speech_start: float = 0.0
+        self._frame_count = 0
+        self._speech_frame_count = 0
 
     def _get_speech_prob(self, pcm_bytes: bytes) -> float:
         import numpy as np
@@ -68,17 +71,40 @@ class AudioVAD:
         # 否则每个前端 PCM 包会让 main loop 卡 ~10-30ms，进而让 aiortc 的
         # RTP 发包和 PlayerStreamTrack.recv 节奏不稳，前端听感卡顿。
         loop = asyncio.get_running_loop()
+        vad_start = now()
         prob = await loop.run_in_executor(None, self._get_speech_prob, frame)
+        vad_ms = elapsed_ms(vad_start)
+        self._frame_count += 1
+        if vad_ms > 30 or self._frame_count <= 3 or self._frame_count % 200 == 0:
+            log_perf(
+                "vad",
+                "frame_inference",
+                vad_ms,
+                state=self.state.value,
+                prob=f"{prob:.3f}",
+                threshold=self.threshold,
+                frame_count=self._frame_count,
+                buffered_bytes=len(self._chunk_buf),
+            )
 
         if self.state == VadState.SILENCE:
             self._pre_buffer.append(frame)
             if prob >= self.threshold:
                 self.state = VadState.SPEECH
                 self._speech_start = time.monotonic()
+                self._speech_frame_count = 0
                 logger.debug(f"VAD: SILENCE → SPEECH (prob={prob:.2f})")
+                log_timepoint(
+                    "VAD",
+                    "SILENCE_TO_SPEECH",
+                    prob=f"{prob:.3f}",
+                    threshold=self.threshold,
+                    prebuffer_frames=len(self._pre_buffer),
+                )
                 await self._on_speech_start(list(self._pre_buffer))
 
         elif self.state == VadState.SPEECH:
+            self._speech_frame_count += 1
             logger.debug(f"VAD: SPEECH prob={prob:.2f} (threshold={self.threshold})")
             if self._on_audio:
                 await self._on_audio(frame)
@@ -86,6 +112,13 @@ class AudioVAD:
                 self.state = VadState.TRAILING
                 self._trailing_start = time.monotonic()
                 logger.debug(f"VAD: SPEECH → TRAILING (prob={prob:.2f})")
+                log_timepoint(
+                    "VAD",
+                    "SPEECH_TO_TRAILING",
+                    prob=f"{prob:.3f}",
+                    speech_frames=self._speech_frame_count,
+                    speech_duration_ms=f"{(time.monotonic() - self._speech_start) * 1000:.2f}",
+                )
             else:
                 elapsed = time.monotonic() - self._speech_start
                 if elapsed > MAX_SESSION_S:
@@ -105,6 +138,24 @@ class AudioVAD:
                 elapsed_ms = (time.monotonic() - self._trailing_start) * 1000
                 if elapsed_ms >= self._trailing_ms:
                     logger.debug("VAD: TRAILING → SILENCE (speech end)")
+                    speech_duration_ms = (time.monotonic() - self._speech_start) * 1000
+                    log_timepoint(
+                        "VAD",
+                        "TRAILING_TO_SILENCE",
+                        prob=f"{prob:.3f}",
+                        trailing_ms=f"{elapsed_ms:.2f}",
+                        threshold_ms=self._trailing_ms,
+                        speech_frames=self._speech_frame_count,
+                        speech_duration_ms=f"{speech_duration_ms:.2f}",
+                    )
+                    log_perf(
+                        "vad",
+                        "speech_segment",
+                        speech_duration_ms,
+                        speech_frames=self._speech_frame_count,
+                        trailing_ms=f"{elapsed_ms:.2f}",
+                        threshold_ms=self._trailing_ms,
+                    )
                     await self._on_speech_end()
                     self.state = VadState.SILENCE
                     self._pre_buffer.clear()

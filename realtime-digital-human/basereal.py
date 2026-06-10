@@ -5,7 +5,7 @@ import soundfile as sf
 from tqdm import tqdm
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor
-from perf_logger import log_perf, log_timepoint
+from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 from ttsreal import (EdgeTTS, VoitsTTS, GSVV2TTS,
                      CosyVoiceTTS, FishTTS, SparkTTS, FlashTTS, IflytekTTS,
                      GonganTTS)
@@ -64,6 +64,9 @@ class BaseReal:
         self._active_tts_trace_id = None
         self._active_tts_segment_index = None
         self._active_tts_first_audio_frame_logged = False
+        self._active_tts_audio_frame_count = 0
+        self._active_tts_audio_sample_count = 0
+        self._active_tts_audio_started_at = None
         self._pending_wav2lip_trace_id = None
         self._pending_wav2lip_segment_index = None
         self._pending_wav2lip_first_output_logged = False
@@ -96,20 +99,63 @@ class BaseReal:
         return self._active_chat_trace_id == trace_id
 
     def set_active_tts_trace(self, trace_id=None, segment_index=None):
+        if (
+            self._active_tts_trace_id is not None
+            and (
+                self._active_tts_trace_id != trace_id
+                or self._active_tts_segment_index != segment_index
+            )
+        ):
+            self._log_active_tts_audio_summary("switch_segment")
         self._active_tts_trace_id = trace_id
         self._active_tts_segment_index = segment_index
         self._active_tts_first_audio_frame_logged = False
+        self._active_tts_audio_frame_count = 0
+        self._active_tts_audio_sample_count = 0
+        self._active_tts_audio_started_at = None
 
     def clear_active_tts_trace(self):
+        self._log_active_tts_audio_summary("clear")
         self._active_tts_trace_id = None
         self._active_tts_segment_index = None
         self._active_tts_first_audio_frame_logged = False
+        self._active_tts_audio_frame_count = 0
+        self._active_tts_audio_sample_count = 0
+        self._active_tts_audio_started_at = None
+
+    def _log_active_tts_audio_summary(self, reason):
+        if self._active_tts_audio_frame_count <= 0:
+            return
+        log_perf(
+            "tts",
+            "audio_frames_to_wav2lip",
+            elapsed_ms(self._active_tts_audio_started_at)
+            if self._active_tts_audio_started_at is not None
+            else None,
+            trace_id=self._active_tts_trace_id,
+            segment_index=self._active_tts_segment_index,
+            frames=self._active_tts_audio_frame_count,
+            samples=self._active_tts_audio_sample_count,
+            audio_duration_ms=f"{self._active_tts_audio_sample_count / self.sample_rate * 1000:.2f}",
+            reason=reason,
+        )
 
     def _prepare_first_audio_frame(self):
         return None
 
     def put_audio_frame(self, audio_chunk):  # 16khz 20ms pcm
         self._audio_push_count += 1
+        if self._active_tts_audio_started_at is None:
+            self._active_tts_audio_started_at = now()
+            log_timepoint(
+                "TTS",
+                "音频帧开始进入Wav2Lip",
+                trace_id=self._active_tts_trace_id,
+                segment_index=self._active_tts_segment_index,
+                samples=len(audio_chunk),
+            )
+        self._active_tts_audio_frame_count += 1
+        self._active_tts_audio_sample_count += len(audio_chunk)
         if not self._active_tts_first_audio_frame_logged:
             self._active_tts_first_audio_frame_logged = True
             self._pending_wav2lip_trace_id = self._active_tts_trace_id
@@ -132,9 +178,16 @@ class BaseReal:
             )
             self._prepare_first_audio_frame()
         self.asr.put_audio_frame(audio_chunk)
-        if self._audio_push_count <= 5 or self._audio_push_count % 100 == 0:
+        if (
+            self._audio_push_count <= 5
+            or self._audio_push_count % 100 == 0
+            or self._active_tts_audio_frame_count <= 3
+        ):
             logger.debug(
                 f"[AUDIO_DIAG] TTS→ASR put_audio_frame #{self._audio_push_count} "
+                f"trace_id={self._active_tts_trace_id} "
+                f"segment_index={self._active_tts_segment_index} "
+                f"segment_frames={self._active_tts_audio_frame_count} "
                 f"samples={len(audio_chunk)} asr_queue={self.asr.queue.qsize()} "
                 f"output_queue={self.asr.output_queue.qsize()} "
                 f"feat_queue={self.asr.feat_queue.qsize()}"

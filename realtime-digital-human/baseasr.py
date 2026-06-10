@@ -2,6 +2,7 @@ import os
 import queue
 import numpy as np
 import torch.multiprocessing as mp
+from loguru import logger
 
 
 class BaseASR:
@@ -26,23 +27,39 @@ class BaseASR:
         self.stride_left_size = opt.l
         self.stride_right_size = opt.r
         self.feat_queue = mp.Queue(2)
+        self.input_frames_received = 0
+        self.input_frames_dropped = 0
+        self.output_frames_dropped = 0
+        self.feat_batches_dropped = 0
 
     def flush_talk(self):
+        cleared = self.queue.qsize()
         self.queue.queue.clear()
+        if cleared:
+            logger.info(f"[AUDIO_DIAG] ASR input queue flushed frames={cleared}")
 
     def reset(self):
         # 清空所有队列
+        cleared_input = self.queue.qsize()
         self.queue.queue.clear()
+        cleared_output = 0
         while not self.output_queue.empty():
             try:
                 self.output_queue.get_nowait()
+                cleared_output += 1
             except:
                 break
+        cleared_feat = 0
         while not self.feat_queue.empty():
             try:
                 self.feat_queue.get_nowait()
+                cleared_feat += 1
             except:
                 break
+        logger.info(
+            f"[AUDIO_DIAG] ASR reset queues cleared input={cleared_input} "
+            f"output={cleared_output} feat={cleared_feat}"
+        )
 
         # 重置帧缓存
         self.frames = []
@@ -51,12 +68,17 @@ class BaseASR:
         self.warm_up()
 
     def pause_talk(self):
+        cleared = self.queue.qsize()
         self.queue.queue.clear()
+        if cleared:
+            logger.info(f"[AUDIO_DIAG] ASR pause_talk cleared input frames={cleared}")
 
     def put_audio_frame(self, audio_chunk):  # 16khz 20ms pcm
+        self.input_frames_received += 1
         try:
             self.queue.put_nowait(audio_chunk)
         except queue.Full:
+            self.input_frames_dropped += 1
             try:
                 self.queue.get_nowait()
             except queue.Empty:
@@ -64,7 +86,15 @@ class BaseASR:
             try:
                 self.queue.put_nowait(audio_chunk)
             except queue.Full:
+                self.input_frames_dropped += 1
                 pass
+            if self.input_frames_dropped <= 5 or self.input_frames_dropped % 50 == 0:
+                logger.warning(
+                    f"[AUDIO_DIAG] ASR input queue full; drop_oldest "
+                    f"received={self.input_frames_received} dropped={self.input_frames_dropped} "
+                    f"queue={self.queue.qsize()}/{self.queue.maxsize} "
+                    f"chunk_samples={len(audio_chunk)}"
+                )
 
     def get_audio_frame(self):
         try:

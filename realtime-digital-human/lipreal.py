@@ -326,6 +326,29 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
         _inf_silence_count = 0
         _inf_real_count = 0
         _inf_audio_miss_count = 0
+
+        def _put_res_frame(item, frame_kind):
+            put_start = now()
+            before_size = res_frame_queue.qsize()
+            res_frame_queue.put(item)
+            put_ms = elapsed_ms(put_start)
+            after_size = res_frame_queue.qsize()
+            if put_ms > 20 or after_size >= getattr(res_frame_queue, "maxsize", 0):
+                logger.warning(
+                    f"[SYNC_DIAG] wav2lip result queue put kind={frame_kind} "
+                    f"blocked_ms={put_ms:.2f} before={before_size} after={after_size} "
+                    f"max={getattr(res_frame_queue, 'maxsize', None)}"
+                )
+                log_perf(
+                    "wav2lip",
+                    "result_queue_put_slow",
+                    put_ms,
+                    frame_kind=frame_kind,
+                    before_size=before_size,
+                    after_size=after_size,
+                    queue_max=getattr(res_frame_queue, "maxsize", None),
+                )
+
         while not quit_event.is_set():
             if reset_event is not None and reset_event.is_set():
                 last_mel_batch = None
@@ -354,8 +377,9 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                             f"idle_total={_inf_idle_count} out_queue={audio_out_queue.qsize()} "
                             f"res_queue={res_frame_queue.qsize()}"
                         )
-                    res_frame_queue.put(
-                        (None, __mirror_index(length, index), None, index)
+                    _put_res_frame(
+                        (None, __mirror_index(length, index), None, index),
+                        "idle_no_feat",
                     )
                     index += 1
                     continue
@@ -392,8 +416,9 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                 if fast_first_pending:
                     time.sleep(0.001)
                     continue
-                res_frame_queue.put(
-                    (None, __mirror_index(length, index), None, index)
+                _put_res_frame(
+                    (None, __mirror_index(length, index), None, index),
+                    "idle_audio_miss",
                 )
                 index += 1
                 continue
@@ -407,8 +432,15 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                         f"feat_queue={audio_feat_queue.qsize()} out_queue={audio_out_queue.qsize()}"
                     )
                 for i in range(current_batch_size):
-                    res_frame_queue.put((None, __mirror_index(length, index),
-                                         audio_frames[i * 2:i * 2 + 2], index))
+                    _put_res_frame(
+                        (
+                            None,
+                            __mirror_index(length, index),
+                            audio_frames[i * 2:i * 2 + 2],
+                            index,
+                        ),
+                        "silence",
+                    )
                     index += 1
             else:
                 _inf_real_count += 1
@@ -498,9 +530,11 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                     counttime = 0
 
                 for i, res_frame in enumerate(pred):
-                    res_frame_queue.put(
+                    _put_res_frame(
                         (res_frame, __mirror_index(length, index),
-                         audio_frames[i * 2:i * 2 + 2], index))
+                         audio_frames[i * 2:i * 2 + 2], index),
+                        "real",
+                    )
                     index += 1
 
         logger.info('lipreal inference processor stop')
@@ -1029,11 +1063,22 @@ class LipReal(BaseReal):
         _render_audio_push = 0
         _render_audio_silence = 0
         _render_video_skip = 0
+        _last_speaking_state = None
+        _render_backpressure_count = 0
 
         while not quit_event.is_set():
             # 视频队列背压：音视频必须同步推进，避免音画漂移。
             # 视频队列已从 6 帧增大到 12 帧，背压触发频率大幅降低。
             if video_track is not None and video_track._queue.qsize() >= self.video_queue_max:
+                _render_backpressure_count += 1
+                if _render_backpressure_count <= 5 or _render_backpressure_count % 200 == 0:
+                    logger.warning(
+                        f"[SYNC_DIAG] render backpressure video_queue={video_track._queue.qsize()} "
+                        f"limit={self.video_queue_max} audio_queue={audio_track._queue.qsize() if audio_track else -1} "
+                        f"trace_id={getattr(self, '_pending_wav2lip_trace_id', None)} "
+                        f"linear_idx={getattr(self, '_next_render_linear_index', None)} "
+                        f"count={_render_backpressure_count}"
+                    )
                 time.sleep(0.005)
                 continue
 
@@ -1110,6 +1155,27 @@ class LipReal(BaseReal):
                 combine_frame = self.blend_images(combine_frame, mask_frame,
                                                   self._render_bg_img)
 
+            if _last_speaking_state is None or _last_speaking_state != self.speaking:
+                logger.info(
+                    f"[SYNC_DIAG] speaking_state_change speaking={self.speaking} "
+                    f"trace_id={getattr(self, '_pending_wav2lip_trace_id', None)} "
+                    f"segment_index={getattr(self, '_pending_wav2lip_segment_index', None)} "
+                    f"linear_idx={linear_idx} avatar_idx={idx} idle={idle_frame} "
+                    f"res_queue={self.res_frame_queue.qsize()} "
+                    f"audio_queue={audio_track._queue.qsize() if audio_track else -1} "
+                    f"video_queue={video_track._queue.qsize() if video_track else -1}"
+                )
+                log_timepoint(
+                    "Wav2Lip",
+                    "说话状态切换",
+                    trace_id=getattr(self, "_pending_wav2lip_trace_id", None),
+                    segment_index=getattr(self, "_pending_wav2lip_segment_index", None),
+                    speaking=self.speaking,
+                    linear_idx=linear_idx,
+                    avatar_idx=idx,
+                )
+                _last_speaking_state = self.speaking
+
             # 音画同步优化：优先推送音频包
             if audio_frames is not None:
                 _has_real_audio = any(t == 0 for _, t in audio_frames)
@@ -1167,6 +1233,20 @@ class LipReal(BaseReal):
                     output_scale=f"{out_scale:.3f}",
                     video_queue=video_track._queue.qsize() if video_track is not None else -1,
                     audio_queue=audio_track._queue.qsize() if audio_track is not None else -1,
+                )
+                log_perf(
+                    "trace",
+                    "wav2lip_first_output_frame",
+                    trace_id=self._pending_wav2lip_trace_id,
+                    segment_index=self._pending_wav2lip_segment_index,
+                    linear_idx=linear_idx,
+                    avatar_idx=idx,
+                    source_size=f"{src_w}x{src_h}",
+                    output_size=f"{out_w}x{out_h}",
+                    output_scale=f"{out_scale:.3f}",
+                    video_queue=video_track._queue.qsize() if video_track is not None else -1,
+                    audio_queue=audio_track._queue.qsize() if audio_track is not None else -1,
+                    res_queue=self.res_frame_queue.qsize(),
                 )
             self._put_track_frame(video_track, new_frame, loop)
             self._last_render_linear_index = linear_idx

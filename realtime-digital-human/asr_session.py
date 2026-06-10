@@ -1,11 +1,14 @@
 import asyncio
+import inspect
 import os
+import uuid
 from typing import TYPE_CHECKING
 
 from asr.factory import create_asr_provider
 from asr.base import BaseASRProvider
 from audio_vad import AudioVAD
 from loguru import logger
+from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 
 if TYPE_CHECKING:
     from aiohttp.web import WebSocketResponse
@@ -37,6 +40,12 @@ class ASRSessionHandler:
         self._state = state
         self._ws = ws
         self._provider: BaseASRProvider | None = None
+        self._trace_id: str | None = None
+        self._speech_start_mono: float | None = None
+        self._audio_frames_sent = 0
+        self._audio_bytes_sent = 0
+        self._prebuffer_frames = 0
+        self._provider_name = os.environ.get("ASR_PROVIDER", "gongan")
         self._vad = AudioVAD(
             on_speech_start=self._on_speech_start,
             on_speech_end=self._on_speech_end,
@@ -52,14 +61,52 @@ class ASRSessionHandler:
         await self._vad.process_chunk(pcm)
 
     async def _on_speech_start(self, pre_buffer: list[bytes]) -> None:
-        logger.info(f"[ASR] speech start, session={self._session_id}")
+        self._trace_id = uuid.uuid4().hex[:12]
+        self._speech_start_mono = now()
+        self._audio_frames_sent = 0
+        self._audio_bytes_sent = 0
+        self._prebuffer_frames = len(pre_buffer)
+        self._provider_name = os.environ.get("ASR_PROVIDER", "gongan")
+        logger.info(
+            f"[ASR] speech start, session={self._session_id}, "
+            f"trace_id={self._trace_id}, prebuffer_frames={len(pre_buffer)}"
+        )
+        log_timepoint(
+            "ASR",
+            "检测到说话开始",
+            trace_id=self._trace_id,
+            sessionid=self._session_id,
+            provider=self._provider_name,
+            prebuffer_frames=len(pre_buffer),
+        )
+        provider_start = now()
         try:
             self._provider = create_asr_provider()
             await self._provider.start_session()
+            log_perf(
+                "asr",
+                "provider_start_session",
+                elapsed_ms(provider_start),
+                trace_id=self._trace_id,
+                sessionid=self._session_id,
+                provider=self._provider_name,
+            )
             for chunk in pre_buffer:
                 await self._provider.send_audio(chunk)
+                self._audio_frames_sent += 1
+                self._audio_bytes_sent += len(chunk)
+            if pre_buffer:
+                log_perf(
+                    "asr",
+                    "prebuffer_sent",
+                    trace_id=self._trace_id,
+                    sessionid=self._session_id,
+                    provider=self._provider_name,
+                    frames=len(pre_buffer),
+                    bytes=sum(len(chunk) for chunk in pre_buffer),
+                )
         except Exception as e:
-            logger.warning(f"[ASR] failed to start provider: {e}")
+            logger.warning(f"[ASR] failed to start provider trace_id={self._trace_id}: {e}")
             if self._provider:
                 try:
                     await self._provider.close()
@@ -70,60 +117,196 @@ class ASRSessionHandler:
     async def _on_audio(self, frame: bytes) -> None:
         if self._provider:
             try:
+                self._audio_frames_sent += 1
+                self._audio_bytes_sent += len(frame)
                 await self._provider.send_audio(frame)
             except Exception as e:
-                logger.warning(f"[ASR] failed to send audio frame: {e}")
+                logger.warning(
+                    f"[ASR] failed to send audio frame trace_id={self._trace_id}: {e}"
+                )
 
     async def _on_speech_end(self) -> None:
         if not self._provider:
             return
-        logger.info(f"[ASR] speech end, session={self._session_id}")
+        trace_id = self._trace_id
+        speech_duration_ms = (
+            elapsed_ms(self._speech_start_mono)
+            if self._speech_start_mono is not None
+            else None
+        )
+        speech_duration_text = (
+            f"{speech_duration_ms:.2f}" if speech_duration_ms is not None else "unknown"
+        )
+        logger.info(
+            f"[ASR] speech end, session={self._session_id}, trace_id={trace_id}, "
+            f"speech_duration_ms={speech_duration_text}, "
+            f"audio_frames={self._audio_frames_sent}, audio_bytes={self._audio_bytes_sent}"
+        )
+        log_timepoint(
+            "ASR",
+            "检测到说话结束",
+            trace_id=trace_id,
+            sessionid=self._session_id,
+            provider=self._provider_name,
+            audio_frames=self._audio_frames_sent,
+            audio_bytes=self._audio_bytes_sent,
+            speech_duration_ms=speech_duration_text,
+        )
         provider = self._provider
         self._provider = None
+        asr_start = now()
+        success = True
         try:
             text = await provider.end_session()
         except Exception as e:
-            logger.warning(f"[ASR] provider end_session failed: {e}")
+            success = False
+            logger.warning(f"[ASR] provider end_session failed trace_id={trace_id}: {e}")
             text = ""
         finally:
+            asr_duration_ms = elapsed_ms(asr_start)
+            log_perf(
+                "asr",
+                "provider_end_session",
+                asr_duration_ms,
+                trace_id=trace_id,
+                sessionid=self._session_id,
+                provider=self._provider_name,
+                success=success,
+                recognized_len=len(text or ""),
+                audio_frames=self._audio_frames_sent,
+                audio_bytes=self._audio_bytes_sent,
+                speech_duration_ms=speech_duration_text,
+            )
+            close_start = now()
             await provider.close()
+            log_perf(
+                "asr",
+                "provider_close",
+                elapsed_ms(close_start),
+                trace_id=trace_id,
+                sessionid=self._session_id,
+                provider=self._provider_name,
+            )
 
         if not text:
-            logger.debug("[ASR] empty result, skipping LLM dispatch")
+            logger.debug(f"[ASR] empty result, skipping LLM dispatch trace_id={trace_id}")
             return
 
-        logger.info(f"[ASR] recognized: {text!r}")
+        logger.info(f"[ASR] recognized trace_id={trace_id}: {text!r}")
+        log_perf(
+            "trace",
+            "asr_done",
+            asr_duration_ms,
+            trace_id=trace_id,
+            sessionid=self._session_id,
+            provider=self._provider_name,
+            recognized_len=len(text),
+            total_from_speech_start_ms=speech_duration_text,
+        )
 
         # 将 ASR 结果推送给前端
-        await self._send_asr_result(text)
+        await self._send_asr_result(text, trace_id=trace_id)
 
-        self._dispatch_to_llm(text)
+        self._dispatch_to_llm(text, trace_id=trace_id)
 
-    async def _send_asr_result(self, text: str) -> None:
+    async def _send_asr_result(self, text: str, trace_id: str | None = None) -> None:
         if not self._ws:
             return
+        start = now()
         try:
-            await self._ws.send_json({"type": "asr", "data": text})
+            await self._ws.send_json({"type": "asr", "data": text, "trace_id": trace_id})
+            log_perf(
+                "asr",
+                "send_result_to_client",
+                elapsed_ms(start),
+                trace_id=trace_id,
+                sessionid=self._session_id,
+                text_len=len(text),
+            )
         except Exception as e:
-            logger.warning(f"[ASR] failed to send result to client: {e}")
+            logger.warning(f"[ASR] failed to send result to client trace_id={trace_id}: {e}")
 
-    def _dispatch_to_llm(self, text: str) -> None:
+    def _dispatch_to_llm(self, text: str, trace_id: str | None = None) -> None:
         nerfreal = self._state.nerfreals.get(self._session_id)
         if not nerfreal:
-            logger.warning(f"[ASR] no nerfreal for session={self._session_id}")
+            logger.warning(f"[ASR] no nerfreal for session={self._session_id}, trace_id={trace_id}")
             return
+        if hasattr(nerfreal, "set_active_chat_trace"):
+            nerfreal.set_active_chat_trace(trace_id)
         result_queue = asyncio.Queue()
         self._state.llm_response_queues[self._session_id] = result_queue
         llm_response = _get_llm_response()
         loop = asyncio.get_event_loop()
+        provider = os.environ.get("LLM_PROVIDER", "gongan")
+        logger.info(
+            f"[ASR] dispatch LLM session={self._session_id}, trace_id={trace_id}, "
+            f"provider={provider}, text_len={len(text)}"
+        )
+        log_timepoint(
+            "LLM",
+            "ASR结果开始进入大模型",
+            trace_id=trace_id,
+            sessionid=self._session_id,
+            provider=provider,
+            text_len=len(text),
+        )
+        log_perf(
+            "trace",
+            "llm_dispatch",
+            trace_id=trace_id,
+            sessionid=self._session_id,
+            provider=provider,
+            text_len=len(text),
+        )
         loop.run_in_executor(
             None,
+            self._timed_llm_response,
             llm_response,
             text,
             nerfreal,
             self._session_id,
             result_queue,
+            trace_id,
         )
+
+    def _timed_llm_response(
+        self,
+        llm_response,
+        text: str,
+        nerfreal,
+        sessionid: str,
+        result_queue: asyncio.Queue,
+        trace_id: str | None,
+    ):
+        provider = os.environ.get("LLM_PROVIDER", "gongan")
+        start = now()
+        success = True
+        try:
+            signature = inspect.signature(llm_response)
+            if "trace_id" in signature.parameters:
+                return llm_response(
+                    text,
+                    nerfreal,
+                    sessionid,
+                    result_queue,
+                    trace_id=trace_id,
+                )
+            return llm_response(text, nerfreal, sessionid, result_queue)
+        except Exception:
+            success = False
+            raise
+        finally:
+            log_perf(
+                "llm",
+                "response_total",
+                elapsed_ms(start),
+                provider=provider,
+                sessionid=sessionid,
+                text_len=len(text),
+                device="external",
+                trace_id=trace_id,
+                success=success,
+            )
 
     async def close(self) -> None:
         if self._provider:

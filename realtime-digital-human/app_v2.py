@@ -107,6 +107,7 @@ class AppState:
         self.model = None
         self.avatar = None
         self.llm_response_queues: Dict[str, asyncio.Queue] = {}
+        self.llm_ws_metrics: Dict[str, Dict[str, Any]] = {}
         self.cleaning_sessions: set[str] = set()
         self.offer_lock = asyncio.Lock()
         self.session_players: Dict[str, HumanPlayer] = {}
@@ -299,7 +300,14 @@ def _nerfreal_snapshot(nerfreal):
             "webrtc_audio_track": audio_track_size,
             "webrtc_video_track": video_track_size,
         },
+        "asr_counters": {
+            "input_frames_received": getattr(asr, "input_frames_received", None),
+            "input_frames_dropped": getattr(asr, "input_frames_dropped", None),
+            "output_frames_dropped": getattr(asr, "output_frames_dropped", None),
+            "feat_batches_dropped": getattr(asr, "feat_batches_dropped", None),
+        },
         "tts_state": str(getattr(tts, "state", None)),
+        "tts_diagnostics": tts.diagnostics() if hasattr(tts, "diagnostics") else None,
     }
 
 
@@ -321,6 +329,7 @@ def _server_metrics_payload(state: AppState):
         "pcs": len(state.pcs),
         "text_websockets": len(state.sessionid_ws),
         "llm_queues": len(state.llm_response_queues),
+        "llm_ws_metrics": _truncate_value(state.llm_ws_metrics),
         "cleaning_sessions": list(state.cleaning_sessions),
         "process": _proc_status_snapshot(),
         "gc_counts": gc.get_count(),
@@ -426,6 +435,7 @@ async def cleanup_session(state: AppState, sessionid: str, pc=None, reason: str 
         active_pc = pc or state.instanceid_pc.get(sessionid)
         state.instanceid_pc.pop(sessionid, None)
         state.session_players.pop(sessionid, None)
+        state.llm_ws_metrics.pop(sessionid, None)
         if active_pc is not None:
             state.pcs.discard(active_pc)
             if active_pc.connectionState != "closed":
@@ -730,16 +740,36 @@ async def human(request):
 
 async def _handle_echo_request(params, sessionid, nerfreal, state: AppState):
     """处理echo请求"""
-    logger.info(f"echo请求内容: {params['text']}")
-    nerfreal.put_msg_txt(params["text"])
-    msg_id = str(uuid.uuid4())
+    trace_id = params.get("trace_id") or uuid.uuid4().hex[:12]
+    text = params["text"]
+    logger.info(f"echo请求内容: {text}, trace_id={trace_id}, len={len(text)}")
+    if hasattr(nerfreal, "set_active_chat_trace"):
+        nerfreal.set_active_chat_trace(trace_id)
+    log_timepoint(
+        "TTS",
+        "echo文本进入TTS",
+        trace_id=trace_id,
+        sessionid=sessionid,
+        text_len=len(text),
+    )
+    log_perf(
+        "trace",
+        "echo_tts_dispatch",
+        trace_id=trace_id,
+        sessionid=sessionid,
+        text_len=len(text),
+    )
+    nerfreal.put_msg_txt(text, trace_id=trace_id, segment_index=1)
+    msg_id = trace_id
 
     ws = await _wait_for_session_ws(state, str(sessionid))
     if ws:
-        await ws.send_json({"data": params["text"], "id": msg_id, "finish": False})
-        await ws.send_json({"data": "", "id": msg_id, "finish": True})
+        await ws.send_json(
+            {"data": text, "id": msg_id, "trace_id": trace_id, "finish": False}
+        )
+        await ws.send_json({"data": "", "id": msg_id, "trace_id": trace_id, "finish": True})
     else:
-        logger.warning(f"echo文本未推送：WebSocket未就绪 sessionid={sessionid}")
+        logger.warning(f"echo文本未推送：WebSocket未就绪 sessionid={sessionid}, trace_id={trace_id}")
 
     return web.Response(
         content_type="application/json", text=json.dumps({"code": 0, "data": "ok"})
@@ -842,9 +872,105 @@ async def _llm_response_consumer(state: AppState):
             while not queue.empty():
                 try:
                     msg_data = queue.get_nowait()
+                    send_data = dict(msg_data)
+                    enqueue_mono = send_data.pop("_perf_enqueued_mono", None)
+                    trace_id = send_data.get("trace_id") or send_data.get("id")
+                    finish = bool(send_data.get("finish"))
+                    text = send_data.get("data") or ""
+                    metric_key = f"{sessionid}:{trace_id}"
+                    metric = state.llm_ws_metrics.setdefault(
+                        metric_key,
+                        {
+                            "sessionid": sessionid,
+                            "trace_id": trace_id,
+                            "created_mono": now(),
+                            "chunks": 0,
+                            "chars": 0,
+                            "first_send_logged": False,
+                            "finish": False,
+                        },
+                    )
+                    if text:
+                        metric["chunks"] += 1
+                        metric["chars"] += len(text)
                     ws = state.sessionid_ws.get(sessionid)
                     if ws:
-                        await ws.send_json(msg_data)
+                        send_start = now()
+                        await ws.send_json(send_data)
+                        send_duration_ms = elapsed_ms(send_start)
+                        queue_delay_ms = (
+                            elapsed_ms(enqueue_mono)
+                            if isinstance(enqueue_mono, (int, float))
+                            else None
+                        )
+                        if text and not metric.get("first_send_logged"):
+                            metric["first_send_logged"] = True
+                            log_timepoint(
+                                "WebSocket",
+                                "大模型首段文本发给前端",
+                                trace_id=trace_id,
+                                sessionid=sessionid,
+                                text_len=len(text),
+                                queue_delay_ms=(
+                                    f"{queue_delay_ms:.2f}"
+                                    if queue_delay_ms is not None
+                                    else None
+                                ),
+                            )
+                            log_perf(
+                                "trace",
+                                "llm_first_ws_send",
+                                send_duration_ms,
+                                trace_id=trace_id,
+                                sessionid=sessionid,
+                                text_len=len(text),
+                                queue_delay_ms=(
+                                    f"{queue_delay_ms:.2f}"
+                                    if queue_delay_ms is not None
+                                    else None
+                                ),
+                            )
+                        elif text:
+                            queue_delay_text = (
+                                f"{queue_delay_ms:.2f}"
+                                if queue_delay_ms is not None
+                                else "unknown"
+                            )
+                            logger.debug(
+                                f"[PIPELINE] llm_ws_chunk trace_id={trace_id} "
+                                f"sessionid={sessionid} len={len(text)} "
+                                f"send_ms={send_duration_ms:.2f} "
+                                f"queue_delay_ms={queue_delay_text}"
+                            )
+                    elif text or finish:
+                        logger.warning(
+                            f"[PIPELINE] no text websocket sessionid={sessionid} "
+                            f"trace_id={trace_id} finish={finish} len={len(text)}"
+                        )
+
+                    if finish:
+                        metric["finish"] = True
+                        total_ms = elapsed_ms(metric.get("created_mono", now()))
+                        log_perf(
+                            "llm",
+                            "ws_send_done",
+                            total_ms,
+                            trace_id=trace_id,
+                            sessionid=sessionid,
+                            chunks=metric.get("chunks"),
+                            chars=metric.get("chars"),
+                            queue_size=queue.qsize(),
+                            websocket_ready=bool(ws),
+                        )
+                        log_perf(
+                            "trace",
+                            "frontend_text_done",
+                            total_ms,
+                            trace_id=trace_id,
+                            sessionid=sessionid,
+                            chunks=metric.get("chunks"),
+                            chars=metric.get("chars"),
+                        )
                 except asyncio.QueueEmpty:
                     break
                 except Exception as e:
@@ -855,8 +981,21 @@ async def _handle_chat_request(params, sessionid, nerfreal, state: AppState):
     """处理chat请求"""
     llm_response = _get_llm_response()
     trace_id = params.get("trace_id") or uuid.uuid4().hex[:12]
+    text = params["text"]
     if hasattr(nerfreal, "set_active_chat_trace"):
         nerfreal.set_active_chat_trace(trace_id)
+    logger.info(
+        f"chat请求进入LLM sessionid={sessionid}, trace_id={trace_id}, "
+        f"text_len={len(text)}, provider={os.environ.get('LLM_PROVIDER', 'gongan')}"
+    )
+    log_timepoint(
+        "LLM",
+        "chat文本进入大模型",
+        trace_id=trace_id,
+        sessionid=sessionid,
+        provider=os.environ.get("LLM_PROVIDER", "gongan"),
+        text_len=len(text),
+    )
     # 创建队列用于接收 LLM 响应
     result_queue = asyncio.Queue()
     state.llm_response_queues[sessionid] = result_queue
@@ -866,7 +1005,7 @@ async def _handle_chat_request(params, sessionid, nerfreal, state: AppState):
         None,
         _timed_llm_response,
         llm_response,
-        params["text"],
+        text,
         nerfreal,
         sessionid,
         result_queue,

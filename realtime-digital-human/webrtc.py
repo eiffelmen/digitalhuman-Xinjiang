@@ -8,6 +8,7 @@ from av.packet import Packet
 import fractions
 from loguru import logger
 from aiortc import MediaStreamTrack
+from perf_logger import elapsed_ms, log_perf, now
 
 
 def _env_video_fps(default: float = 25.0) -> float:
@@ -64,6 +65,8 @@ class PlayerStreamTrack(MediaStreamTrack):
         self._last_recv_wall = None
         self._recv_count = 0
         self._max_queue_size_seen = 0
+        self._empty_wait_count = 0
+        self._slow_wait_count = 0
         self.timelist = []  # 记录最近包的时间戳
         self.current_frame_count = 0
         if self.kind == 'video':
@@ -141,6 +144,15 @@ class PlayerStreamTrack(MediaStreamTrack):
             f"WebRTC {self.kind} queue dropped {self._dropped_frames} stale frames; "
             f"qsize={self._queue.qsize()}/{self._queue.maxsize}"
         )
+        log_perf(
+            "webrtc",
+            "track_queue_drop",
+            kind=self.kind,
+            dropped_since_last_log=self._dropped_frames,
+            total_dropped_frames=self._total_dropped_frames,
+            queue_size=self._queue.qsize(),
+            queue_max=self._queue.maxsize,
+        )
         self._dropped_frames = 0
         self._last_drop_log = now
 
@@ -190,7 +202,31 @@ class PlayerStreamTrack(MediaStreamTrack):
 
     async def recv(self) -> Union[Frame, Packet]:
         self._player._start(self)
+        wait_start = now()
+        queue_before = self._queue.qsize()
         frame = await self._queue.get()
+        wait_ms = elapsed_ms(wait_start)
+        if queue_before == 0:
+            self._empty_wait_count += 1
+        if wait_ms > (40 if self.kind == "video" else 30):
+            self._slow_wait_count += 1
+            if self._slow_wait_count <= 5 or self._slow_wait_count % 50 == 0:
+                logger.warning(
+                    f"[SYNC_DIAG] WebRTC {self.kind} recv waited {wait_ms:.2f}ms "
+                    f"queue_before={queue_before} queue_after={self._queue.qsize()} "
+                    f"empty_waits={self._empty_wait_count} slow_waits={self._slow_wait_count}"
+                )
+                log_perf(
+                    "webrtc",
+                    "track_recv_wait_slow",
+                    wait_ms,
+                    kind=self.kind,
+                    queue_before=queue_before,
+                    queue_after=self._queue.qsize(),
+                    empty_waits=self._empty_wait_count,
+                    slow_waits=self._slow_wait_count,
+                    recv_count=self._recv_count,
+                )
         if frame is None:
             self.stop()
             raise Exception
@@ -208,6 +244,19 @@ class PlayerStreamTrack(MediaStreamTrack):
                 self.framecount = 0
                 self.totaltime = 0
         self._recv_count += 1
+        if self._recv_count <= 5 or self._recv_count % 500 == 0:
+            log_perf(
+                "webrtc",
+                "track_recv",
+                wait_ms,
+                kind=self.kind,
+                recv_count=self._recv_count,
+                queue_before=queue_before,
+                queue_after=self._queue.qsize(),
+                empty_waits=self._empty_wait_count,
+                slow_waits=self._slow_wait_count,
+                total_dropped_frames=self._total_dropped_frames,
+            )
         self._last_recv_wall = time.time()
         return frame
 
@@ -225,6 +274,8 @@ class PlayerStreamTrack(MediaStreamTrack):
             "current_frame_count": self.current_frame_count,
             "total_dropped_frames": self._total_dropped_frames,
             "pending_dropped_frames": self._dropped_frames,
+            "empty_wait_count": self._empty_wait_count,
+            "slow_wait_count": self._slow_wait_count,
             "last_recv_age_s": last_recv_age_s,
         }
 

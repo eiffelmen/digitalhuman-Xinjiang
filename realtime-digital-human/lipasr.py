@@ -2,6 +2,7 @@ import numpy as np
 import queue
 from baseasr import BaseASR
 from wav2lip256 import audio
+from loguru import logger
 
 
 class LipASR(BaseASR):
@@ -69,6 +70,22 @@ class LipASR(BaseASR):
 
         try:
             target_queue.get_nowait()
+            if target_queue is self.output_queue:
+                self.output_frames_dropped += 1
+                if self.output_frames_dropped <= 5 or self.output_frames_dropped % 50 == 0:
+                    logger.warning(
+                        f"[AUDIO_DIAG] ASR output_queue full; drop_oldest "
+                        f"dropped={self.output_frames_dropped} "
+                        f"queue={self.output_queue.qsize()}"
+                    )
+            elif target_queue is self.feat_queue:
+                self.feat_batches_dropped += 1
+                if self.feat_batches_dropped <= 5 or self.feat_batches_dropped % 20 == 0:
+                    logger.warning(
+                        f"[AUDIO_DIAG] ASR feat_queue full; drop_oldest "
+                        f"dropped={self.feat_batches_dropped} "
+                        f"queue={self.feat_queue.qsize()}"
+                    )
         except Exception:
             pass
         try:
