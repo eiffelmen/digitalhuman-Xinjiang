@@ -59,7 +59,11 @@ class PlayerStreamTrack(MediaStreamTrack):
         maxsize = WEBRTC_VIDEO_QUEUE_MAX if kind == "video" else WEBRTC_AUDIO_QUEUE_MAX
         self._queue = asyncio.Queue(maxsize=maxsize)
         self._dropped_frames = 0
+        self._total_dropped_frames = 0
         self._last_drop_log = 0.0
+        self._last_recv_wall = None
+        self._recv_count = 0
+        self._max_queue_size_seen = 0
         self.timelist = []  # 记录最近包的时间戳
         self.current_frame_count = 0
         if self.kind == 'video':
@@ -116,6 +120,7 @@ class PlayerStreamTrack(MediaStreamTrack):
             except asyncio.QueueFull:
                 dropped += 1
 
+        self._max_queue_size_seen = max(self._max_queue_size_seen, self._queue.qsize())
         if dropped:
             self._log_dropped_frames(dropped)
 
@@ -128,6 +133,7 @@ class PlayerStreamTrack(MediaStreamTrack):
 
     def _log_dropped_frames(self, dropped: int) -> None:
         self._dropped_frames += dropped
+        self._total_dropped_frames += dropped
         now = time.monotonic()
         if now - self._last_drop_log < WEBRTC_DROP_LOG_INTERVAL:
             return
@@ -201,7 +207,26 @@ class PlayerStreamTrack(MediaStreamTrack):
                 )
                 self.framecount = 0
                 self.totaltime = 0
+        self._recv_count += 1
+        self._last_recv_wall = time.time()
         return frame
+
+    def diagnostics(self):
+        last_recv_age_s = None
+        if self._last_recv_wall is not None:
+            last_recv_age_s = round(time.time() - self._last_recv_wall, 3)
+        return {
+            "kind": self.kind,
+            "ready_state": self.readyState,
+            "queue_size": self._queue.qsize(),
+            "queue_max": self._queue.maxsize,
+            "max_queue_size_seen": self._max_queue_size_seen,
+            "recv_count": self._recv_count,
+            "current_frame_count": self.current_frame_count,
+            "total_dropped_frames": self._total_dropped_frames,
+            "pending_dropped_frames": self._dropped_frames,
+            "last_recv_age_s": last_recv_age_s,
+        }
 
     def stop(self):
         super().stop()
@@ -250,6 +275,14 @@ class HumanPlayer:
         A :class:`aiortc.MediaStreamTrack` instance if the file contains video.
         """
         return self.__video
+
+    def diagnostics(self):
+        return {
+            "thread_alive": bool(self.__thread and self.__thread.is_alive()),
+            "started_tracks": [track.kind for track in self.__started],
+            "audio": self.__audio.diagnostics() if self.__audio else None,
+            "video": self.__video.diagnostics() if self.__video else None,
+        }
 
     def _start(self, track: PlayerStreamTrack) -> None:
         self.__started.add(track)

@@ -96,3 +96,43 @@ Useful fallback: if the engine has not been generated yet, run with PyTorch firs
 ```bash
 WAV2LIP_BACKEND=pytorch ./start.sh
 ```
+
+## Long-running Playback Diagnostics
+
+The project includes browser and backend diagnostics for investigating the issue where the digital human becomes choppy after running for 20-30 minutes and recovers after refreshing the browser.
+
+Enable the diagnostics in the backend `.env`:
+
+```bash
+SERVER_METRICS_ENABLED=1
+SERVER_METRICS_INTERVAL_S=10
+CLIENT_METRICS_MAX_BYTES=120000
+CLIENT_METRICS_MAX_TEXT=3000
+```
+
+Enable the diagnostics in the frontend `.env` before rebuilding the frontend image:
+
+```bash
+VITE_CLIENT_METRICS_ENABLED=1
+VITE_CLIENT_METRICS_INTERVAL_MS=10000
+VITE_CLIENT_METRICS_VERBOSE=0
+VITE_AUDIO_STREAM_METRICS_INTERVAL_MS=10000
+```
+
+After rebuilding and restarting the frontend/backend, reproduce the problem in the browser until playback becomes choppy. Then collect the backend logs:
+
+```bash
+cd /home/dsd/wz/digitalhuman-Xinjiang/realtime-digital-human
+latest_log=$(ls -t logs/file_*.log | head -1)
+
+grep -E '\[CLIENT_METRICS\]|\[SERVER_METRICS\]|actual avg final fps|queue dropped|interrupt request|audio_ws_|video_' "$latest_log" \
+  > /tmp/digitalhuman-stall-diagnostics.log
+```
+
+Send `/tmp/digitalhuman-stall-diagnostics.log` and the full latest backend log if possible.
+
+What the diagnostics contain:
+
+- `[CLIENT_METRICS]`: browser-side video/audio element state, WebRTC ICE/connection state, inbound RTP stats, decoded/dropped video frame deltas, JS heap usage, page visibility, viewport, and audio capture/send counters.
+- `[SERVER_METRICS]`: backend process RSS/thread/file-descriptor snapshot, CUDA memory snapshot, active sessions, WebRTC peer connection states, per-session render queues, audio queues, TTS state, Wav2Lip frame queue, and track output queues.
+- Event logs: WebRTC offer/answer timing, track arrival, video `playing/waiting/stalled/error`, audio WebSocket lifecycle, microphone recorder lifecycle, and interrupt requests.

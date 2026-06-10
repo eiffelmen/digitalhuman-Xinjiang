@@ -2,7 +2,8 @@ import os
 import time
 import json
 import inspect
-from typing import Dict
+import gc
+from typing import Any, Dict
 import uuid
 import asyncio
 import argparse
@@ -14,6 +15,21 @@ load_dotenv(override=True)
 
 import os as _os
 from mylogger import logger as _early_logger
+
+_SENSITIVE_ENV_HINTS = ("KEY", "PWD", "PASSWORD", "TOKEN", "SECRET")
+
+
+def _mask_env_value(key, value):
+    if value is None:
+        return None
+    if any(hint in key.upper() for hint in _SENSITIVE_ENV_HINTS):
+        text = str(value)
+        if len(text) <= 8:
+            return "***"
+        return f"{text[:3]}***{text[-3:]}"
+    return value
+
+
 _early_logger.info("=== 启动环境变量 ===")
 for _k in ["CUDA_VISIBLE_DEVICES", "LLM_PROVIDER", "ASR_PROVIDER",
            "IFLYTEK_SN", "IFLY_APP_ID", "IFLY_API_KEY", "IFLYTEK_VCN",
@@ -22,7 +38,7 @@ for _k in ["CUDA_VISIBLE_DEVICES", "LLM_PROVIDER", "ASR_PROVIDER",
            "FUNASR_HOST", "FUNASR_PORT", "GONGAN_API_BASE_URL",
            "GONGAN_MODEL_NAME", "GONGAN_DIRECT_TTS", "LISTEN_PORT"]:
     _v = _os.environ.get(_k)
-    _early_logger.info(f"  {_k} = {_v!r}")
+    _early_logger.info(f"  {_k} = {_mask_env_value(_k, _v)!r}")
 _early_logger.info("===================")
 
 from tomlkit import dumps, parse
@@ -52,6 +68,35 @@ MAX_ACTIVE_WEBRTC_SESSIONS = max(
 )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, default) or default))
+    except (TypeError, ValueError):
+        logger.warning(f"{name} 配置无效，使用默认值 {default}")
+        return max(minimum, default)
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default) or default))
+    except (TypeError, ValueError):
+        logger.warning(f"{name} 配置无效，使用默认值 {default}")
+        return max(minimum, default)
+
+
+SERVER_METRICS_ENABLED = _env_bool("SERVER_METRICS_ENABLED", True)
+SERVER_METRICS_INTERVAL_S = _env_float("SERVER_METRICS_INTERVAL_S", 10.0, 2.0)
+CLIENT_METRICS_MAX_BYTES = _env_int("CLIENT_METRICS_MAX_BYTES", 120000, 1024)
+CLIENT_METRICS_MAX_TEXT = _env_int("CLIENT_METRICS_MAX_TEXT", 3000, 256)
+
+
 class AppState:
     def __init__(self):
         self.nerfreals: Dict[str, BaseReal] = {}
@@ -64,6 +109,7 @@ class AppState:
         self.llm_response_queues: Dict[str, asyncio.Queue] = {}
         self.cleaning_sessions: set[str] = set()
         self.offer_lock = asyncio.Lock()
+        self.session_players: Dict[str, HumanPlayer] = {}
 
 
 class ConfigManager:
@@ -105,6 +151,196 @@ class ConfigManager:
             logger.error(f"保存配置文件失败: {str(e)}")
 
 
+def _truncate_value(value: Any, max_text: int = CLIENT_METRICS_MAX_TEXT):
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _truncate_value(item, max_text)
+            for key, item in list(value.items())[:120]
+        }
+    if isinstance(value, list):
+        return [_truncate_value(item, max_text) for item in value[:80]]
+    if isinstance(value, tuple):
+        return tuple(_truncate_value(item, max_text) for item in value[:80])
+    if isinstance(value, str) and len(value) > max_text:
+        return value[:max_text] + f"...<truncated:{len(value)}>"
+    return value
+
+
+def _json_dumps_for_log(payload: Any) -> str:
+    try:
+        return json.dumps(
+            _truncate_value(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"log_encode_error": str(exc), "payload_type": type(payload).__name__},
+            ensure_ascii=False,
+        )
+
+
+def _safe_qsize(target_queue):
+    if target_queue is None:
+        return None
+    try:
+        return target_queue.qsize()
+    except Exception:
+        return None
+
+
+def _safe_queue_max(target_queue):
+    if target_queue is None:
+        return None
+    return getattr(target_queue, "maxsize", getattr(target_queue, "_maxsize", None))
+
+
+def _proc_status_snapshot():
+    status = {}
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                if key in {
+                    "VmRSS",
+                    "VmHWM",
+                    "VmSize",
+                    "VmData",
+                    "VmSwap",
+                    "Threads",
+                    "FDSize",
+                }:
+                    status[key] = value.strip()
+    except Exception:
+        pass
+
+    try:
+        status["open_fds"] = len(os.listdir("/proc/self/fd"))
+    except Exception:
+        status["open_fds"] = None
+
+    return status
+
+
+def _cuda_snapshot():
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {"available": False}
+        return {
+            "available": True,
+            "device_name": torch.cuda.get_device_name(0),
+            "memory_allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 2),
+            "memory_reserved_mb": round(torch.cuda.memory_reserved() / 1024 / 1024, 2),
+            "max_memory_allocated_mb": round(
+                torch.cuda.max_memory_allocated() / 1024 / 1024, 2
+            ),
+            "max_memory_reserved_mb": round(
+                torch.cuda.max_memory_reserved() / 1024 / 1024, 2
+            ),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _pc_snapshot(pc):
+    if pc is None:
+        return None
+    return {
+        "connectionState": getattr(pc, "connectionState", None),
+        "iceConnectionState": getattr(pc, "iceConnectionState", None),
+        "iceGatheringState": getattr(pc, "iceGatheringState", None),
+        "signalingState": getattr(pc, "signalingState", None),
+    }
+
+
+def _nerfreal_snapshot(nerfreal):
+    if nerfreal is None:
+        return None
+
+    asr = getattr(nerfreal, "asr", None)
+    tts = getattr(nerfreal, "tts", None)
+    audio_track_size, video_track_size = (None, None)
+    try:
+        if hasattr(nerfreal, "_media_track_queue_sizes"):
+            audio_track_size, video_track_size = nerfreal._media_track_queue_sizes()
+    except Exception:
+        pass
+
+    return {
+        "speaking": getattr(nerfreal, "speaking", None),
+        "curr_state": getattr(nerfreal, "curr_state", None),
+        "audio_push_count": getattr(nerfreal, "_audio_push_count", None),
+        "render_next_linear_index": getattr(nerfreal, "_next_render_linear_index", None),
+        "render_last_linear_index": getattr(nerfreal, "_last_render_linear_index", None),
+        "render_cache_size": len(getattr(nerfreal, "_render_cache", {}) or {}),
+        "render_cache_limit": getattr(nerfreal, "render_cache_size", None),
+        "inference_thread_alive": bool(
+            getattr(nerfreal, "inference_thread", None)
+            and nerfreal.inference_thread.is_alive()
+        ),
+        "queues": {
+            "asr_input": _safe_qsize(getattr(asr, "queue", None)),
+            "asr_input_max": _safe_queue_max(getattr(asr, "queue", None)),
+            "asr_output": _safe_qsize(getattr(asr, "output_queue", None)),
+            "asr_output_max": _safe_queue_max(getattr(asr, "output_queue", None)),
+            "asr_feat": _safe_qsize(getattr(asr, "feat_queue", None)),
+            "asr_feat_max": _safe_queue_max(getattr(asr, "feat_queue", None)),
+            "tts_text": _safe_qsize(getattr(tts, "msgqueue", None)),
+            "tts_text_max": _safe_queue_max(getattr(tts, "msgqueue", None)),
+            "wav2lip_frames": _safe_qsize(getattr(nerfreal, "res_frame_queue", None)),
+            "wav2lip_frames_max": _safe_queue_max(
+                getattr(nerfreal, "res_frame_queue", None)
+            ),
+            "webrtc_audio_track": audio_track_size,
+            "webrtc_video_track": video_track_size,
+        },
+        "tts_state": str(getattr(tts, "state", None)),
+    }
+
+
+def _server_metrics_payload(state: AppState):
+    sessions = {}
+    for sessionid, nerfreal in list(state.nerfreals.items()):
+        player = state.session_players.get(sessionid)
+        sessions[sessionid] = {
+            "pc": _pc_snapshot(state.instanceid_pc.get(sessionid)),
+            "has_text_ws": sessionid in state.sessionid_ws,
+            "llm_queue": _safe_qsize(state.llm_response_queues.get(sessionid)),
+            "nerfreal": _nerfreal_snapshot(nerfreal),
+            "player": player.diagnostics() if player else None,
+        }
+
+    return {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "active_sessions": len(state.nerfreals),
+        "pcs": len(state.pcs),
+        "text_websockets": len(state.sessionid_ws),
+        "llm_queues": len(state.llm_response_queues),
+        "cleaning_sessions": list(state.cleaning_sessions),
+        "process": _proc_status_snapshot(),
+        "gc_counts": gc.get_count(),
+        "cuda": _cuda_snapshot(),
+        "sessions": sessions,
+    }
+
+
+async def _server_metrics_loop(state: AppState):
+    while True:
+        await asyncio.sleep(SERVER_METRICS_INTERVAL_S)
+        try:
+            logger.info(
+                "[SERVER_METRICS] "
+                + _json_dumps_for_log(_server_metrics_payload(state))
+            )
+        except Exception as exc:
+            logger.warning(f"[SERVER_METRICS] collect failed: {exc}")
+
+
 async def health_check(request):
     """检查服务状态"""
     return web.json_response({"code": 0, "message": "服务正常"})
@@ -112,6 +348,33 @@ async def health_check(request):
 async def ready(request):
     """查询服务是否已经完全启动（包括模型已经预热）"""
     return web.json_response({"status": 1})
+
+
+async def client_metrics(request):
+    """接收浏览器端播放/WebRTC/内存指标，统一写入后端日志。"""
+    remote = request.remote
+    ua = request.headers.get("User-Agent", "")
+    try:
+        raw = await request.read()
+        if len(raw) > CLIENT_METRICS_MAX_BYTES:
+            logger.warning(
+                f"[CLIENT_METRICS] payload too large remote={remote} bytes={len(raw)}"
+            )
+            return web.json_response({"code": 413, "message": "payload too large"}, status=413)
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except Exception as exc:
+        logger.warning(f"[CLIENT_METRICS] invalid payload remote={remote}: {exc}")
+        return web.json_response({"code": 400, "message": "invalid payload"}, status=400)
+
+    payload = _truncate_value(payload)
+    envelope = {
+        "remote": remote,
+        "user_agent": ua[:300],
+        "payload": payload,
+    }
+    logger.info("[CLIENT_METRICS] " + _json_dumps_for_log(envelope))
+    return web.json_response({"code": 0, "data": "ok"})
+
 
 def build_nerfreal(session_id, opt, model, state: AppState):
     """
@@ -162,6 +425,7 @@ async def cleanup_session(state: AppState, sessionid: str, pc=None, reason: str 
     try:
         active_pc = pc or state.instanceid_pc.get(sessionid)
         state.instanceid_pc.pop(sessionid, None)
+        state.session_players.pop(sessionid, None)
         if active_pc is not None:
             state.pcs.discard(active_pc)
             if active_pc.connectionState != "closed":
@@ -339,6 +603,7 @@ async def offer(request):
             await cleanup_session(state, sessionid, pc, f"webrtc {pc.connectionState}")
 
     player = HumanPlayer(state.nerfreals[sessionid])
+    state.session_players[sessionid] = player
     pc.addTrack(player.audio)
     pc.addTrack(player.video)
 
@@ -384,6 +649,7 @@ async def interrupt(request):
         return web.json_response({"code": 400, "message": "数字人实例尚未初始化"}, status=400)
     if hasattr(nerfreal, "set_active_chat_trace"):
         nerfreal.set_active_chat_trace(None)
+    logger.info(f"interrupt request: sessionid={sessionid}")
     nerfreal.flush_talk()
 
     return web.Response(
@@ -446,6 +712,9 @@ async def human(request):
 
     # 处理中断请求
     if params.get("interrupt"):
+        logger.info(
+            f"human request interrupt=True sessionid={sessionid} type={params.get('type')}"
+        )
         nerfreal.flush_talk()
 
     # 根据请求类型处理
@@ -908,6 +1177,7 @@ async def run(push_url, sessionid, state: AppState):
             await cleanup_session(state, sessionid, pc, f"rtcpush {pc.connectionState}")
 
     player = HumanPlayer(state.nerfreals[sessionid])
+    state.session_players[sessionid] = player
     audio_sender = pc.addTrack(player.audio)
     video_sender = pc.addTrack(player.video)
 
@@ -1056,6 +1326,7 @@ if __name__ == "__main__":
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/human", human)
     appasync.router.add_post("/interrupt", interrupt)
+    appasync.router.add_post("/client_metrics", client_metrics)
     appasync.router.add_post("/close_session", close_session)
     appasync.router.add_post("/set_audiotype", set_audiotype)
     appasync.router.add_post("/is_speaking", is_speaking)
@@ -1104,6 +1375,7 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _llm_consumer_task = None
+        _server_metrics_task = None
 
         try:
             loop.run_until_complete(runner.setup())
@@ -1112,6 +1384,8 @@ if __name__ == "__main__":
 
             # 启动 LLM 响应消费者任务（后台任务，不阻塞事件循环）
             _llm_consumer_task = asyncio.ensure_future(_llm_response_consumer(state))
+            if SERVER_METRICS_ENABLED:
+                _server_metrics_task = asyncio.ensure_future(_server_metrics_loop(state))
 
             if opt.transport == "rtcpush":
                 for k in range(opt.max_session):
@@ -1136,6 +1410,13 @@ if __name__ == "__main__":
                 _llm_consumer_task.cancel()
                 try:
                     loop.run_until_complete(_llm_consumer_task)
+                except asyncio.CancelledError:
+                    pass
+
+            if _server_metrics_task is not None and not _server_metrics_task.done():
+                _server_metrics_task.cancel()
+                try:
+                    loop.run_until_complete(_server_metrics_task)
                 except asyncio.CancelledError:
                     pass
 

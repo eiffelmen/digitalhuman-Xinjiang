@@ -4,12 +4,19 @@ import { store } from '@/store/store';
 import { nextTick, onMounted, onUnmounted, ref, defineEmits } from 'vue';
 import { buildApiUrl, buildWsUrl } from '@/config';
 import { getPublicUrl } from '@/utils/getAssets';
+import { createClientDiagnostics } from '@/utils/clientDiagnostics';
 let pc = null;
 let backendCloseSent = false;
 let currentVideoStream = null;
 let currentAudioStream = null;
 let videoLoadedHandler = null;
 let videoPlayingHandler = null;
+let videoWaitingHandler = null;
+let videoStalledHandler = null;
+let videoErrorHandler = null;
+let audioWaitingHandler = null;
+let audioStalledHandler = null;
+let diagnostics = null;
 defineExpose({
 	getPoster,
 	start,
@@ -24,6 +31,10 @@ function startPlayVideo() {
 	if (!videoElem) return;
 	videoElem.play().catch(error => {
 		console.error('Error playing video:', error);
+		diagnostics?.mark('video_play_error', {
+			name: error?.name,
+			message: error?.message || String(error),
+		});
 	});
 	videoElem.muted = false;
 }
@@ -75,10 +86,38 @@ function start() {
 
 	pc = new RTCPeerConnection(config);
 	const peer = pc;
+	diagnostics = createClientDiagnostics({
+		sessionId: eventBus.sessionId,
+		getPeerConnection: () => (pc === peer ? peer : null),
+		getVideoElement: () => document.getElementById('video'),
+		getAudioElement: () => document.getElementById('audio'),
+	});
+	diagnostics.start('webrtc_start');
 	// pc = new RTCPeerConnection();
+
+	peer.addEventListener('iceconnectionstatechange', () => {
+		diagnostics?.mark('ice_connection_state_change', {
+			iceConnectionState: peer.iceConnectionState,
+		});
+	});
+	peer.addEventListener('icegatheringstatechange', () => {
+		diagnostics?.mark('ice_gathering_state_change', {
+			iceGatheringState: peer.iceGatheringState,
+		});
+	});
+	peer.addEventListener('signalingstatechange', () => {
+		diagnostics?.mark('signaling_state_change', {
+			signalingState: peer.signalingState,
+		});
+	});
 
 	// connect audio / video
 	peer.addEventListener('track', evt => {
+		diagnostics?.mark('track_received', {
+			kind: evt.track.kind,
+			trackId: evt.track.id,
+			streamIds: evt.streams.map(stream => stream.id),
+		});
 		if (evt.track.kind === 'video') {
 			const videoElem = document.getElementById('video');
 			if (!videoElem) return;
@@ -91,9 +130,23 @@ function start() {
 			if (videoPlayingHandler) {
 				videoElem.removeEventListener('playing', videoPlayingHandler);
 			}
+			if (videoWaitingHandler) {
+				videoElem.removeEventListener('waiting', videoWaitingHandler);
+			}
+			if (videoStalledHandler) {
+				videoElem.removeEventListener('stalled', videoStalledHandler);
+			}
+			if (videoErrorHandler) {
+				videoElem.removeEventListener('error', videoErrorHandler);
+			}
 			currentVideoStream = evt.streams[0];
 			videoElem.srcObject = evt.streams[0];
 			videoLoadedHandler = () => {
+				diagnostics?.mark('video_loadedmetadata', {
+					videoWidth: videoElem.videoWidth,
+					videoHeight: videoElem.videoHeight,
+					readyState: videoElem.readyState,
+				});
 				nextTick(() => {
 					loading.value = false;
 				});
@@ -103,9 +156,35 @@ function start() {
 			// 监听视频真正开始播放的事件
 			videoPlayingHandler = () => {
 				console.log('Video is now playing');
+				diagnostics?.mark('video_playing', {
+					videoWidth: videoElem.videoWidth,
+					videoHeight: videoElem.videoHeight,
+					readyState: videoElem.readyState,
+				});
 				emit('videoReady', true);
 			};
 			videoElem.addEventListener('playing', videoPlayingHandler, { once: true });
+			videoWaitingHandler = () => {
+				diagnostics?.mark('video_waiting', {
+					currentTime: videoElem.currentTime,
+					readyState: videoElem.readyState,
+				});
+			};
+			videoStalledHandler = () => {
+				diagnostics?.mark('video_stalled', {
+					currentTime: videoElem.currentTime,
+					readyState: videoElem.readyState,
+				});
+			};
+			videoErrorHandler = () => {
+				diagnostics?.mark('video_error', {
+					errorCode: videoElem.error?.code,
+					errorMessage: videoElem.error?.message,
+				});
+			};
+			videoElem.addEventListener('waiting', videoWaitingHandler);
+			videoElem.addEventListener('stalled', videoStalledHandler);
+			videoElem.addEventListener('error', videoErrorHandler);
 		} else {
 			const audioElem = document.getElementById('audio');
 			if (!audioElem) return;
@@ -114,10 +193,33 @@ function start() {
 			}
 			currentAudioStream = evt.streams[0];
 			audioElem.srcObject = evt.streams[0];
+			if (audioWaitingHandler) {
+				audioElem.removeEventListener('waiting', audioWaitingHandler);
+			}
+			if (audioStalledHandler) {
+				audioElem.removeEventListener('stalled', audioStalledHandler);
+			}
+			audioWaitingHandler = () => {
+				diagnostics?.mark('audio_waiting', {
+					currentTime: audioElem.currentTime,
+					readyState: audioElem.readyState,
+				});
+			};
+			audioStalledHandler = () => {
+				diagnostics?.mark('audio_stalled', {
+					currentTime: audioElem.currentTime,
+					readyState: audioElem.readyState,
+				});
+			};
+			audioElem.addEventListener('waiting', audioWaitingHandler);
+			audioElem.addEventListener('stalled', audioStalledHandler);
 		}
 	});
 	peer.addEventListener('connectionstatechange', () => {
 		if (pc !== peer) return;
+		diagnostics?.mark('connection_state_change', {
+			connectionState: peer.connectionState,
+		});
 		if (['failed', 'disconnected'].includes(peer.connectionState)) {
 			stop({ notifyBackend: peer.connectionState === 'failed' });
 		}
@@ -152,6 +254,11 @@ function notifyBackendClose() {
 
 function stop(options = {}) {
 	const { notifyBackend = true } = options;
+	diagnostics?.mark('webrtc_stop_requested', { notifyBackend });
+	if (diagnostics) {
+		diagnostics.stop('webrtc_stop');
+		diagnostics = null;
+	}
 	if (notifyBackend) {
 		notifyBackendClose();
 	}
@@ -172,11 +279,31 @@ function stop(options = {}) {
 			videoElem.removeEventListener('playing', videoPlayingHandler);
 			videoPlayingHandler = null;
 		}
+		if (videoWaitingHandler) {
+			videoElem.removeEventListener('waiting', videoWaitingHandler);
+			videoWaitingHandler = null;
+		}
+		if (videoStalledHandler) {
+			videoElem.removeEventListener('stalled', videoStalledHandler);
+			videoStalledHandler = null;
+		}
+		if (videoErrorHandler) {
+			videoElem.removeEventListener('error', videoErrorHandler);
+			videoErrorHandler = null;
+		}
 		videoElem.pause();
 		videoElem.srcObject = null;
 	}
 	const audioElem = document.getElementById('audio');
 	if (audioElem) {
+		if (audioWaitingHandler) {
+			audioElem.removeEventListener('waiting', audioWaitingHandler);
+			audioWaitingHandler = null;
+		}
+		if (audioStalledHandler) {
+			audioElem.removeEventListener('stalled', audioStalledHandler);
+			audioStalledHandler = null;
+		}
 		audioElem.pause();
 		audioElem.srcObject = null;
 	}
@@ -203,6 +330,9 @@ function negotiate() {
 			.createOffer()
 			.then(offer => {
 				console.log(offer);
+				diagnostics?.mark('offer_created', {
+					sdpLength: offer?.sdp?.length,
+				});
 				return pc.setLocalDescription(offer);
 			})
 			// 等待 ICE 聚集完成
@@ -215,6 +345,7 @@ function negotiate() {
 						const checkState = () => {
 							if (pc.iceGatheringState === 'complete') {
 								console.log('webrtc connected');
+								diagnostics?.mark('ice_gathering_complete');
 								pc.removeEventListener('icegatheringstatechange', checkState);
 								resolve();
 							}
@@ -227,6 +358,10 @@ function negotiate() {
 			.then(() => {
 				var offer = pc.localDescription;
 				console.log('negotiate eventBus.sessionId:', eventBus.sessionId);
+				diagnostics?.mark('offer_post_start', {
+					sessionid: eventBus.sessionId,
+					sdpLength: offer?.sdp?.length,
+				});
 				return fetch(buildApiUrl('backend', '/offer'), {
 					body: JSON.stringify({
 						sdp: offer.sdp,
@@ -244,6 +379,9 @@ function negotiate() {
 				if (!response.ok) {
 					throw new Error(`Failed to send offer: ${response.statusText}`);
 				} else {
+					diagnostics?.mark('offer_post_success', {
+						status: response.status,
+					});
 					emit('offerSuccess', true);
 					return response;
 				}
@@ -265,12 +403,21 @@ function negotiate() {
 				// 	background_image: answer.config.bg_img,
 				// });
 				store.changeWebrtcStatus(true);
+				diagnostics?.mark('remote_description_start', {
+					answerType: answer?.type,
+					sdpLength: answer?.sdp?.length,
+					sessionid: answer?.sessionid,
+				});
 				return pc.setRemoteDescription(answer);
 			})
 			.catch(e => {
 				// alert(e)
 				console.log(e);
 				console.log('negotiate error:', e);
+				diagnostics?.mark('negotiate_error', {
+					name: e?.name,
+					message: e?.message || String(e),
+				});
 				store.changeWebrtcStatus(false);
 			})
 	);
@@ -278,11 +425,20 @@ function negotiate() {
 
 const beforeUnloadHandler = () => {
 	console.log('webrtc closeing');
+	diagnostics?.mark('beforeunload');
 	stop({ notifyBackend: true });
 };
 
 const pageHideHandler = () => {
+	diagnostics?.mark('pagehide');
 	stop({ notifyBackend: true });
+};
+
+const visibilityChangeHandler = () => {
+	diagnostics?.mark('visibility_change', {
+		visibilityState: document.visibilityState,
+		hidden: document.hidden,
+	});
 };
 
 onMounted(() => {
@@ -298,11 +454,13 @@ onMounted(() => {
 	// 关闭网页后清理
 	window.addEventListener('beforeunload', beforeUnloadHandler);
 	window.addEventListener('pagehide', pageHideHandler);
+	document.addEventListener('visibilitychange', visibilityChangeHandler);
 });
 
 onUnmounted(() => {
 	window.removeEventListener('beforeunload', beforeUnloadHandler);
 	window.removeEventListener('pagehide', pageHideHandler);
+	document.removeEventListener('visibilitychange', visibilityChangeHandler);
 	stop({ notifyBackend: true });
 });
 </script>
