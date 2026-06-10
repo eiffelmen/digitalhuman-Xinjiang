@@ -59,8 +59,8 @@ export function useAudioStream(sessionId) {
           16000,
         ).data
 
-        // 数字人正在说话时：先触发打断，再送 ASR
-        if (store.avatarSpeaking && !interruptCooling) {
+        // 数字人正在说话时：检测到较大音量才触发打断，再送 ASR
+        if (powerLevel > 20 && store.avatarSpeaking && !interruptCooling) {
           interruptCooling = true
           callInterrupt(sessionId).finally(() => {
             interruptCoolingTimer = setTimeout(() => {
