@@ -141,13 +141,36 @@ What the diagnostics contain:
 
 The backend also emits trace-level logs for each user request. Every request has a `trace_id`, which is carried through VAD, ASR, LLM, TTS, Wav2Lip, and WebRTC output.
 
+By default, focused pipeline diagnostics are written to:
+
+```bash
+realtime-digital-human/logs/pipeline_diagnostics.log
+```
+
+The path can be changed in backend `.env`:
+
+```bash
+PIPELINE_DIAG_LOG_ENABLED=1
+PIPELINE_DIAG_LOG_PATH=./logs/pipeline_diagnostics.log
+PIPELINE_DIAG_LOG_LEVEL=DEBUG
+PIPELINE_DIAG_LOG_ROTATION=200 MB
+PIPELINE_DIAG_LOG_RETENTION=7 days
+```
+
 Use this when investigating:
 
 - Slow digital human response.
 - TTS audio being cut off or incomplete.
 - TTS audio and mouth movement not matching.
 
-After reproducing the issue, collect the focused pipeline log:
+After reproducing the issue, send this focused log file:
+
+```bash
+cd /home/dsd/wz/digitalhuman-Xinjiang/realtime-digital-human
+ls -lh logs/pipeline_diagnostics.log
+```
+
+If the focused file is unavailable, collect the same information from the full backend log:
 
 ```bash
 cd /home/dsd/wz/digitalhuman-Xinjiang/realtime-digital-human
@@ -157,7 +180,7 @@ grep -E '\[PERF\]|\[时间点\]|\[AUDIO_DIAG\]|\[SYNC_DIAG\]|GonganTTS|Gongan LL
   > /tmp/digitalhuman-pipeline-diagnostics.log
 ```
 
-Send `/tmp/digitalhuman-pipeline-diagnostics.log` plus the full latest backend log if possible.
+Send `logs/pipeline_diagnostics.log` plus the full latest backend log if possible.
 
 Important actions to compare by `trace_id`:
 
