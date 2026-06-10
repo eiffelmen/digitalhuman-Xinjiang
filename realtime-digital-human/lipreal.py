@@ -449,7 +449,6 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                     if _audio_leftover:
                         frame, type = _audio_leftover.pop(0)
                     else:
-                        # 改为非阻塞，防止进入推理时被 ASR 的瞬时延迟卡住
                         frame, type = audio_out_queue.get(block=False)
                     audio_frames.append((frame, type))
                     if type == 0:
@@ -473,14 +472,8 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                         f"leftover={len(_audio_leftover)} "
                         f"miss_total={_inf_audio_miss_count}"
                     )
-                if fast_first_pending:
-                    time.sleep(0.001)
-                    continue
-                _put_res_frame(
-                    (None, __mirror_index(length, index), None, index),
-                    "idle_audio_miss",
-                )
-                index += 1
+                # 等待几毫秒让ASR队列填满，而不是插入导致画面抽搐和时间轴错乱的发呆帧
+                time.sleep(0.002)
                 continue
 
             if is_all_silence:
