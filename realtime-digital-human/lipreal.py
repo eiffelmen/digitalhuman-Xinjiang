@@ -326,28 +326,77 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
         _inf_silence_count = 0
         _inf_real_count = 0
         _inf_audio_miss_count = 0
+        queue_put_diag_interval_s = float(
+            os.environ.get("RESULT_QUEUE_PUT_DIAG_INTERVAL_S", "5")
+        )
+        _queue_put_has_logged = False
+        _last_queue_put_diag_mono = 0.0
+        _queue_put_slow_count = 0
+        _queue_put_slow_total_ms = 0.0
+        _queue_put_slow_max_ms = 0.0
+        _queue_put_slow_kind_counts = {}
 
         def _put_res_frame(item, frame_kind):
+            nonlocal _queue_put_has_logged
+            nonlocal _last_queue_put_diag_mono
+            nonlocal _queue_put_slow_count
+            nonlocal _queue_put_slow_total_ms
+            nonlocal _queue_put_slow_max_ms
+            nonlocal _queue_put_slow_kind_counts
+
             put_start = now()
             before_size = res_frame_queue.qsize()
             res_frame_queue.put(item)
             put_ms = elapsed_ms(put_start)
             after_size = res_frame_queue.qsize()
             if put_ms > 20 or after_size >= getattr(res_frame_queue, "maxsize", 0):
-                logger.warning(
-                    f"[SYNC_DIAG] wav2lip result queue put kind={frame_kind} "
-                    f"blocked_ms={put_ms:.2f} before={before_size} after={after_size} "
-                    f"max={getattr(res_frame_queue, 'maxsize', None)}"
+                _queue_put_slow_count += 1
+                _queue_put_slow_total_ms += put_ms
+                _queue_put_slow_max_ms = max(_queue_put_slow_max_ms, put_ms)
+                _queue_put_slow_kind_counts[frame_kind] = (
+                    _queue_put_slow_kind_counts.get(frame_kind, 0) + 1
                 )
-                log_perf(
-                    "wav2lip",
-                    "result_queue_put_slow",
-                    put_ms,
-                    frame_kind=frame_kind,
-                    before_size=before_size,
-                    after_size=after_size,
-                    queue_max=getattr(res_frame_queue, "maxsize", None),
-                )
+
+                current = now()
+                if (
+                    not _queue_put_has_logged
+                    or current - _last_queue_put_diag_mono >= queue_put_diag_interval_s
+                ):
+                    _queue_put_has_logged = True
+                    _last_queue_put_diag_mono = current
+                    avg_put_ms = _queue_put_slow_total_ms / max(1, _queue_put_slow_count)
+                    kind_counts = ",".join(
+                        f"{kind}:{count}"
+                        for kind, count in sorted(_queue_put_slow_kind_counts.items())
+                    )
+                    logger.warning(
+                        f"[SYNC_DIAG] wav2lip result queue put slow/blocked "
+                        f"events={_queue_put_slow_count} kinds={kind_counts} "
+                        f"latest_kind={frame_kind} latest_blocked_ms={put_ms:.2f} "
+                        f"avg_blocked_ms={avg_put_ms:.2f} "
+                        f"max_blocked_ms={_queue_put_slow_max_ms:.2f} "
+                        f"before={before_size} after={after_size} "
+                        f"max={getattr(res_frame_queue, 'maxsize', None)} "
+                        f"interval_s={queue_put_diag_interval_s:.1f}"
+                    )
+                    log_perf(
+                        "wav2lip",
+                        "result_queue_put_slow",
+                        put_ms,
+                        slow_events=_queue_put_slow_count,
+                        kind_counts=kind_counts,
+                        latest_frame_kind=frame_kind,
+                        before_size=before_size,
+                        after_size=after_size,
+                        queue_max=getattr(res_frame_queue, "maxsize", None),
+                        avg_blocked_ms=f"{avg_put_ms:.2f}",
+                        max_blocked_ms=f"{_queue_put_slow_max_ms:.2f}",
+                        interval_s=f"{queue_put_diag_interval_s:.1f}",
+                    )
+                    _queue_put_slow_count = 0
+                    _queue_put_slow_total_ms = 0.0
+                    _queue_put_slow_max_ms = 0.0
+                    _queue_put_slow_kind_counts = {}
 
         while not quit_event.is_set():
             if reset_event is not None and reset_event.is_set():
