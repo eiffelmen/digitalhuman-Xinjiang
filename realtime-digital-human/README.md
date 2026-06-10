@@ -30,6 +30,12 @@
 uv sync
 ```
 
+首次部署完成后建议验证关键依赖：
+
+```bash
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
 如果访问 Hugging Face 有问题，可在运行前设置：
 
 ```bash
@@ -60,10 +66,17 @@ LLM_PROVIDER=rag LISTEN_PORT=8010 CUDA_VISIBLE_DEVICES=0 bash run_digitalman_ser
 
 默认仍使用 PyTorch 推理；如果部署机已经安装好 NVIDIA 驱动、CUDA 与 TensorRT，可先生成 TensorRT engine，再通过环境变量启用。
 
+先安装导出和构建需要的包：
+
+```bash
+uv pip install onnx tensorrt-cu12
+uv run python -c "import tensorrt as trt; print(trt.__version__)"
+```
+
 1. 导出 ONNX：
 
 ```bash
-python scripts/export_wav2lip_onnx.py \
+uv run python scripts/export_wav2lip_onnx.py \
   --checkpoint ./wav2lip256/wav2lip.pth \
   --output ./wav2lip256/wav2lip_256.onnx
 ```
@@ -71,12 +84,20 @@ python scripts/export_wav2lip_onnx.py \
 2. 检查 ONNX 输入输出：
 
 ```bash
-python scripts/inspect_wav2lip_onnx.py ./wav2lip256/wav2lip_256.onnx
+uv run python scripts/inspect_wav2lip_onnx.py ./wav2lip256/wav2lip_256.onnx
 ```
 
 3. 构建 TensorRT engine：
 
 ```bash
+PRECISION=fp16 \
+ONNX_PATH=./wav2lip256/wav2lip_256.onnx \
+ENGINE_PATH=./wav2lip256/wav2lip_server_fp16.engine \
+MODEL_SIZE=256 \
+MIN_BATCH=1 \
+OPT_BATCH=16 \
+MAX_BATCH=16 \
+WORKSPACE_MIB=2048 \
 bash scripts/build_wav2lip_tensorrt.sh
 ```
 
@@ -84,7 +105,7 @@ bash scripts/build_wav2lip_tensorrt.sh
 
 ```bash
 WAV2LIP_BACKEND=tensorrt \
-WAV2LIP_ENGINE_PATH=./wav2lip256/wav2lip_fp16.engine \
+WAV2LIP_ENGINE_PATH=./wav2lip256/wav2lip_server_fp16.engine \
 bash run_digitalman_server.sh
 ```
 
@@ -107,7 +128,18 @@ TTS_TEXT_QUEUE_MAX=32
 PERF_LOG_ENABLED=1
 ```
 
-没有生成 engine 时不要切到 `WAV2LIP_BACKEND=tensorrt`，否则服务会在加载模型阶段报错。
+没有生成 engine 时不要切到 `WAV2LIP_BACKEND=tensorrt`，否则服务会在加载模型阶段报错。需要先跑通服务时可临时使用：
+
+```bash
+WAV2LIP_BACKEND=pytorch bash run_digitalman_server.sh
+```
+
+常见报错：
+
+- `ModuleNotFoundError: No module named 'torch'`：先执行 `uv sync`。
+- `ModuleNotFoundError: No module named 'tensorrt'`：执行 `uv pip install tensorrt-cu12`。
+- `TensorRT engine not found`：先按上面的步骤生成 `wav2lip_server_fp16.engine`。
+- `exec: python: not found`：当前构建脚本已优先使用 `uv run --no-sync python`；如果仍遇到，确认已安装 `uv` 或 `python3`。
 
 ### 访问方式
 

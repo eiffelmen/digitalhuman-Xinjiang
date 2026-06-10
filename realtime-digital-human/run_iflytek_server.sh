@@ -14,7 +14,12 @@ export TTS_PROVIDER=${TTS_PROVIDER:-gongantts}
 export LISTEN_PORT=${LISTEN_PORT:-8010}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 
-exec uv run --no-sync python app_v2.py \
+UV_RUN_ARGS=()
+if [ "${UV_NO_SYNC:-0}" = "1" ]; then
+  UV_RUN_ARGS+=(--no-sync)
+fi
+
+exec uv run "${UV_RUN_ARGS[@]}" python app_v2.py \
   --max_session 10 \
   --avatar_id wav2lip_avatar11 \
   --tts "$TTS_PROVIDER" \

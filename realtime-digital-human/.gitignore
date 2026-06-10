@@ -5,6 +5,8 @@ build/
 *.mp4
 
 *.pth
+*.engine
+*.onnx
 *.log
 *.wav
 *.zip

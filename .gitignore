@@ -22,6 +22,8 @@ certs/
 
 # Runtime assets that should be stored outside GitHub
 realtime-digital-human/wav2lip256/wav2lip.pth
+realtime-digital-human/wav2lip256/*.engine
+realtime-digital-human/wav2lip256/*.onnx
 realtime-digital-human/data/avatars/
 !realtime-digital-human/data/avatars/.gitkeep
 realtime-digital-human/data.zip
