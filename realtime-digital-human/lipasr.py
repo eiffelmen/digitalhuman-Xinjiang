@@ -57,7 +57,8 @@ class LipASR(BaseASR):
 
     def _put_drop_oldest(self, target_queue, item):
         try:
-            target_queue.put_nowait(item)
+            # 引入阻塞背压，让 ASR 处理速度被下游消耗速度限制，防止堆积
+            target_queue.put(item, block=True, timeout=2.0)
             return
         except queue.Full:
             pass
@@ -68,6 +69,7 @@ class LipASR(BaseASR):
             except Exception:
                 pass
 
+        # 兜底死锁防护：只有在阻塞2秒后依然塞不进去，为了防止管线假死，丢弃老旧帧腾出空间
         try:
             target_queue.get_nowait()
             if target_queue is self.output_queue:

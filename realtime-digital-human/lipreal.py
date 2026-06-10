@@ -398,9 +398,12 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                     _queue_put_slow_max_ms = 0.0
                     _queue_put_slow_kind_counts = {}
 
+        _audio_leftover = []
+
         while not quit_event.is_set():
             if reset_event is not None and reset_event.is_set():
                 last_mel_batch = None
+                _audio_leftover = []
                 start_index = _consume_latest_queue_value(speech_start_index_queue)
                 if start_index is not None:
                     index = max(0, int(start_index))
@@ -443,8 +446,11 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
             audio_frames = []
             try:
                 for _ in range(current_batch_size * 2):
-                    # 改为非阻塞，防止进入推理时被 ASR 的瞬时延迟卡住
-                    frame, type = audio_out_queue.get(block=False)
+                    if _audio_leftover:
+                        frame, type = _audio_leftover.pop(0)
+                    else:
+                        # 改为非阻塞，防止进入推理时被 ASR 的瞬时延迟卡住
+                        frame, type = audio_out_queue.get(block=False)
                     audio_frames.append((frame, type))
                     if type == 0:
                         is_all_silence = False
@@ -454,12 +460,17 @@ def inference(quit_event, batch_size, face_list_cycle, audio_feat_queue,
                 last_mel_batch = mel_batch
                 _inf_audio_miss_count += 1
                 got = len(audio_frames)
+                
+                # 核心修复：把刚才取出来的没凑够的音频存回缓冲，防止吞掉部分开头和中间的声音
+                _audio_leftover = audio_frames + _audio_leftover
+
                 if _inf_audio_miss_count <= 5 or _inf_audio_miss_count % 250 == 0:
                     logger.debug(
                         f"[AUDIO_DIAG] inference #{_inf_count}: audio MISS "
                         f"need={current_batch_size * 2} got={got} "
                         f"mel_batch_size={current_batch_size} "
                         f"out_queue={audio_out_queue.qsize()} "
+                        f"leftover={len(_audio_leftover)} "
                         f"miss_total={_inf_audio_miss_count}"
                     )
                 if fast_first_pending:

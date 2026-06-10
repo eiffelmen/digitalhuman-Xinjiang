@@ -1278,6 +1278,10 @@ class GonganTTSStream:
                 logger.warning(f"GonganTTS stream recv error: {exc}")
         finally:
             self._owner._flush_audio_state(self._audio_state)
+            for _ in range(self._owner._trailing_frames):
+                if self._owner.state == State.RUNNING:
+                    self._owner.parent.put_audio_frame(np.zeros(self._owner.chunk, dtype=np.float32))
+
             log_perf(
                 "tts",
                 "stream_recv_done",
@@ -1307,13 +1311,17 @@ class GonganTTS(BaseTTS):
         self._source_sample_rate = int(os.environ.get("GONGAN_TTS_SAMPLE_RATE", "24000"))
         self._finish_timeout = env_float("GONGAN_TTS_FINISH_TIMEOUT", 20.0)
         self._ws_timeout = env_float("GONGAN_TTS_WS_TIMEOUT", 60.0)
+        self._trailing_frames = int(os.environ.get("GONGAN_TTS_TRAILING_FRAMES", "15"))
+        self._leading_frames = int(os.environ.get("GONGAN_TTS_LEADING_FRAMES", "5"))
         self._active_stream = None
         self._active_lock = Lock()
         self._tts_ts_lock = Lock()
         self._reset_tts_timestamps()
         logger.info(
             f"GonganTTS config: spk_id={self._spk_id}, "
-            f"sample_rate={self._source_sample_rate}"
+            f"sample_rate={self._source_sample_rate}, "
+            f"trailing_frames={self._trailing_frames}, "
+            f"leading_frames={self._leading_frames}"
         )
 
     def flush_talk(self):
@@ -1568,9 +1576,25 @@ class GonganTTS(BaseTTS):
             segment_index=self._current_trace_fields().get("segment_index"),
             text_len=len(msg),
         )
+        # 将数据全量接收后再推送，避免网络抖动导致数字人播放中间卡顿和非正常闭嘴
+        all_chunks = []
         for chunk in self._iter_tts_once(msg):
+            all_chunks.append(chunk)
+
+        # 添加前置静音垫高，防止播放器初始连接或者解码关键帧时吃掉开头的几个字
+        for _ in range(self._leading_frames):
+            if self.state == State.RUNNING:
+                self.parent.put_audio_frame(np.zeros(self.chunk, dtype=np.float32))
+
+        for chunk in all_chunks:
             self._push_raw_pcm(chunk, state)
+            
         self._flush_audio_state(state)
+
+        for _ in range(self._trailing_frames):
+            if self.state == State.RUNNING:
+                self.parent.put_audio_frame(np.zeros(self.chunk, dtype=np.float32))
+
         total_ms = (time.perf_counter() - start) * 1000
         logger.info(
             f"GonganTTS total time trace_id={self._current_trace_fields().get('trace_id')}: "

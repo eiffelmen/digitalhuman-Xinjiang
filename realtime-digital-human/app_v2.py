@@ -381,7 +381,7 @@ async def client_metrics(request):
         "user_agent": ua[:300],
         "payload": payload,
     }
-    logger.info("[CLIENT_METRICS] " + _json_dumps_for_log(envelope))
+    # logger.info("[CLIENT_METRICS] " + _json_dumps_for_log(envelope))
     return web.json_response({"code": 0, "data": "ok"})
 
 

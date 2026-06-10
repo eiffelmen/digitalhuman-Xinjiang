@@ -76,21 +76,16 @@ class BaseASR:
     def put_audio_frame(self, audio_chunk):  # 16khz 20ms pcm
         self.input_frames_received += 1
         try:
-            self.queue.put_nowait(audio_chunk)
+            # 引入阻塞式背压，最多等待2秒。如果下游（Wav2Lip推理）处理太慢，
+            # 这里会卡住上游TTS继续塞入，防止无限积压产生严重延迟或吃字
+            self.queue.put(audio_chunk, block=True, timeout=2.0)
         except queue.Full:
+            # 极端保护机制：只有当等待2秒依旧满载（说明整条管线发生死锁或彻底崩溃），
+            # 才丢弃这一帧（不再丢老帧），保证系统不会被无限挂起。
             self.input_frames_dropped += 1
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.queue.put_nowait(audio_chunk)
-            except queue.Full:
-                self.input_frames_dropped += 1
-                pass
             if self.input_frames_dropped <= 5 or self.input_frames_dropped % 50 == 0:
                 logger.warning(
-                    f"[AUDIO_DIAG] ASR input queue full; drop_oldest "
+                    f"[AUDIO_DIAG] ASR input queue put timeout (2s); blocked! "
                     f"received={self.input_frames_received} dropped={self.input_frames_dropped} "
                     f"queue={self.queue.qsize()}/{self.queue.maxsize} "
                     f"chunk_samples={len(audio_chunk)}"

@@ -128,6 +128,14 @@ class AudioVAD:
                     self._pre_buffer.clear()
                     self._model.reset_states()
 
+                elapsed = time.monotonic() - self._speech_start
+                if elapsed > MAX_SESSION_S:
+                    logger.warning("VAD: max session duration reached, forcing end")
+                    await self._on_speech_end()
+                    self.state = VadState.SILENCE
+                    self._pre_buffer.clear()
+                    self._model.reset_states()
+
         elif self.state == VadState.TRAILING:
             if prob >= self.threshold:
                 self.state = VadState.SPEECH
@@ -135,15 +143,15 @@ class AudioVAD:
                 if self._on_audio:
                     await self._on_audio(frame)
             else:
-                elapsed_ms = (time.monotonic() - self._trailing_start) * 1000
-                if elapsed_ms >= self._trailing_ms:
+                trailing_elapsed_ms = (time.monotonic() - self._trailing_start) * 1000
+                if trailing_elapsed_ms >= self._trailing_ms:
                     logger.debug("VAD: TRAILING → SILENCE (speech end)")
                     speech_duration_ms = (time.monotonic() - self._speech_start) * 1000
                     log_timepoint(
                         "VAD",
                         "TRAILING_TO_SILENCE",
                         prob=f"{prob:.3f}",
-                        trailing_ms=f"{elapsed_ms:.2f}",
+                        trailing_ms=f"{trailing_elapsed_ms:.2f}",
                         threshold_ms=self._trailing_ms,
                         speech_frames=self._speech_frame_count,
                         speech_duration_ms=f"{speech_duration_ms:.2f}",
@@ -153,7 +161,7 @@ class AudioVAD:
                         "speech_segment",
                         speech_duration_ms,
                         speech_frames=self._speech_frame_count,
-                        trailing_ms=f"{elapsed_ms:.2f}",
+                        trailing_ms=f"{trailing_elapsed_ms:.2f}",
                         threshold_ms=self._trailing_ms,
                     )
                     await self._on_speech_end()
