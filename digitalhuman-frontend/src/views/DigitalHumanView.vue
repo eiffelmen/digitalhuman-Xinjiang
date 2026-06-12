@@ -237,6 +237,10 @@ function initChatQuestionWebSocket() {
 	}
 }
 
+function handleAsrResult(text) {
+	chatQuestionRef.value?.showAsrResult?.(text);
+}
+
 onMounted(async () => {
 	// 暴露全局方法给安卓 WebView 调用
 	window.handleFaceStatus = handleFaceStatus;
@@ -365,7 +369,7 @@ onUnmounted(() => {
 					ref="chatRef"
 					@close="handleMessageClose"
 					@recordChange="val => recordChange(val)"
-					@asr-result="val => chatQuestionRef?.showAsrResult(val)"
+					@asr-result="handleAsrResult"
 				/>
 			</div>
 

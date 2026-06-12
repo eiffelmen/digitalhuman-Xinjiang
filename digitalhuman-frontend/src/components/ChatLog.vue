@@ -217,7 +217,7 @@ function startInactivityTimeout() {
 
 function resetFinishedTimeout() {
   clearAllTimeouts();
-  
+
   // 设置新的超时：30秒后隐藏对话框
   closeChatTimeoutId = setTimeout(() => {
     console.log("FINISHED状态超时，隐藏对话框");
@@ -225,6 +225,16 @@ function resetFinishedTimeout() {
     transitionTo(STATES.IDLE);
     startInactivityTimeout();
   }, 30000);
+}
+
+function extractAsrText(msg) {
+	return (msg?.data || msg?.text || msg?.result || '').trim();
+}
+
+function publishAsrResult(text) {
+	if (!text) return;
+	emits('asr-result', text);
+	window.dispatchEvent(new CustomEvent('asr-intermediate', { detail: text }));
 }
 
 const initLLMSocket = () => {
@@ -237,7 +247,7 @@ const initLLMSocket = () => {
 
 					// ASR 识别结果，转发给 ChatQuestion 显示
 					if (msg.type === 'asr') {
-						emits('asr-result', msg.data || '');
+						publishAsrResult(extractAsrText(msg));
 						return;
 					}
 

@@ -287,14 +287,21 @@ class ASRSessionHandler:
         *,
         is_final: bool = True,
     ) -> None:
-        if not self._ws:
+        ws = await self._wait_for_text_ws(timeout=1.0 if is_final else 0.2)
+        if not ws:
+            logger.warning(
+                f"[ASR] text websocket not ready; cannot send result "
+                f"session={self._session_id}, trace_id={trace_id}, is_final={is_final}"
+            )
             return
         start = now()
         try:
-            await self._ws.send_json(
+            await ws.send_json(
                 {
                     "type": "asr",
                     "data": text,
+                    "text": text,
+                    "result": text,
                     "trace_id": trace_id,
                     "is_final": is_final,
                     "partial": not is_final,
@@ -311,6 +318,20 @@ class ASRSessionHandler:
             )
         except Exception as e:
             logger.warning(f"[ASR] failed to send result to client trace_id={trace_id}: {e}")
+
+    async def _wait_for_text_ws(self, timeout: float = 0.0):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while True:
+            ws = self._state.sessionid_ws.get(self._session_id)
+            if ws is None:
+                ws = self._ws
+            if ws is not None and not getattr(ws, "closed", False):
+                self._ws = ws
+                return ws
+            if loop.time() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
 
     def _dispatch_to_llm(self, text: str, trace_id: str | None = None) -> None:
         nerfreal = self._state.nerfreals.get(self._session_id)
