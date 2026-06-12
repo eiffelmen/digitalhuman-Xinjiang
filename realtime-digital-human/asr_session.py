@@ -53,6 +53,7 @@ class ASRSessionHandler:
         self._last_audio_diag_mono = 0.0
         self._last_speaking_skip_diag_mono = 0.0
         self._had_speaking_skip = False
+        self._last_asr_partial_text = ""
         self._vad = AudioVAD(
             on_speech_start=self._on_speech_start,
             on_speech_end=self._on_speech_end,
@@ -112,6 +113,7 @@ class ASRSessionHandler:
         self._audio_bytes_sent = 0
         self._prebuffer_frames = len(pre_buffer)
         self._provider_name = os.environ.get("ASR_PROVIDER", "gongan")
+        self._last_asr_partial_text = ""
         logger.info(
             f"[ASR] speech start, session={self._session_id}, "
             f"trace_id={self._trace_id}, prebuffer_frames={len(pre_buffer)}"
@@ -127,6 +129,8 @@ class ASRSessionHandler:
         provider_start = now()
         try:
             self._provider = create_asr_provider()
+            if hasattr(self._provider, "set_partial_callback"):
+                self._provider.set_partial_callback(self._handle_asr_partial)
             await self._provider.start_session()
             log_perf(
                 "asr",
@@ -250,16 +254,52 @@ class ASRSessionHandler:
         )
 
         # 将 ASR 结果推送给前端
-        await self._send_asr_result(text, trace_id=trace_id)
+        await self._send_asr_result(text, trace_id=trace_id, is_final=True)
 
         self._dispatch_to_llm(text, trace_id=trace_id)
 
-    async def _send_asr_result(self, text: str, trace_id: str | None = None) -> None:
+    async def _handle_asr_partial(self, text: str, *, is_final: bool = False) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if not is_final and text == self._last_asr_partial_text:
+            return
+        self._last_asr_partial_text = text
+        logger.info(
+            f"[ASR] partial result trace_id={self._trace_id}, "
+            f"session={self._session_id}, is_final={is_final}, text={text!r}"
+        )
+        log_perf(
+            "asr",
+            "partial_result_to_client",
+            trace_id=self._trace_id,
+            sessionid=self._session_id,
+            provider=self._provider_name,
+            text_len=len(text),
+            is_final=is_final,
+        )
+        await self._send_asr_result(text, trace_id=self._trace_id, is_final=is_final)
+
+    async def _send_asr_result(
+        self,
+        text: str,
+        trace_id: str | None = None,
+        *,
+        is_final: bool = True,
+    ) -> None:
         if not self._ws:
             return
         start = now()
         try:
-            await self._ws.send_json({"type": "asr", "data": text, "trace_id": trace_id})
+            await self._ws.send_json(
+                {
+                    "type": "asr",
+                    "data": text,
+                    "trace_id": trace_id,
+                    "is_final": is_final,
+                    "partial": not is_final,
+                }
+            )
             log_perf(
                 "asr",
                 "send_result_to_client",
@@ -267,6 +307,7 @@ class ASRSessionHandler:
                 trace_id=trace_id,
                 sessionid=self._session_id,
                 text_len=len(text),
+                is_final=is_final,
             )
         except Exception as e:
             logger.warning(f"[ASR] failed to send result to client trace_id={trace_id}: {e}")

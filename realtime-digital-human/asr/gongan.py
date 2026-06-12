@@ -25,9 +25,33 @@ class GonganASRProvider(BaseASRProvider):
         self._recv_task = None
         self._done = asyncio.Event()
         self._closed = False
+        self._partial_callback = None
+        self._last_partial_text = ""
+
+    def set_partial_callback(self, callback) -> None:
+        """Register an async callback for streaming ASR partial text."""
+        self._partial_callback = callback
+
+    async def _emit_partial(self, text: str, *, is_final: bool = False) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if not is_final and text == self._last_partial_text:
+            return
+        self._last_partial_text = text
+        callback = self._partial_callback
+        if not callback:
+            return
+        try:
+            result = callback(text, is_final=is_final)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.warning(f"Gongan ASR partial callback failed: {exc}")
 
     async def start_session(self) -> None:
         self._pcm_buf.clear()
+        self._last_partial_text = ""
         if not self._streaming:
             await asyncio.to_thread(self._client.ensure_login)
             logger.info("Gongan ASR buffered session started")
@@ -201,12 +225,14 @@ class GonganASRProvider(BaseASRProvider):
 
             logger.debug(f"Gongan ASR message: {data}")
             text = data.get("result") or data.get("text") or ""
-            if text:
-                self._latest_text = text
-
             status = data.get("status")
             signal = data.get("signal")
-            if status in (2, "2") or signal in {"end", "finished"}:
+            is_final = status in (2, "2") or signal in {"end", "finished"}
+            if text:
+                self._latest_text = text
+                await self._emit_partial(text, is_final=is_final)
+
+            if is_final:
                 self._done.set()
                 return
 
