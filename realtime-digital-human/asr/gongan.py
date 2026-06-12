@@ -23,13 +23,21 @@ class GonganASRProvider(BaseASRProvider):
         self._send_interval = env_float("GONGAN_ASR_SEND_INTERVAL", 0.01)
         self._use_punctuation = env_bool("GONGAN_ASR_PUNCTUATION", True)
         self._streaming = env_bool("GONGAN_ASR_STREAMING", False)
+        self._buffered_partials = env_bool("GONGAN_ASR_BUFFERED_PARTIALS", True)
+        self._partial_interval = env_float("GONGAN_ASR_PARTIAL_INTERVAL", 1.0)
+        self._partial_min_bytes = int(os.environ.get("GONGAN_ASR_PARTIAL_MIN_BYTES", "24000"))
         self._pcm_buf = bytearray()
         self._recv_task = None
+        self._partial_task = None
         self._ready = asyncio.Event()
         self._done = asyncio.Event()
         self._closed = False
         self._partial_callback = None
         self._last_partial_text = ""
+        self._last_partial_mono = 0.0
+        self._closed_send_drop_count = 0
+        self._last_closed_send_log_mono = 0.0
+        self._loop = None
 
     def set_partial_callback(self, callback) -> None:
         """Register an async callback for streaming ASR partial text."""
@@ -53,12 +61,16 @@ class GonganASRProvider(BaseASRProvider):
             logger.warning(f"Gongan ASR partial callback failed: {exc}")
 
     async def start_session(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._pcm_buf.clear()
         self._latest_text = ""
         self._last_partial_text = ""
         self._ready = asyncio.Event()
         self._done = asyncio.Event()
         self._closed = False
+        self._last_partial_mono = 0.0
+        self._closed_send_drop_count = 0
+        self._last_closed_send_log_mono = 0.0
         if not self._streaming:
             await asyncio.to_thread(self._client.ensure_login)
             logger.info("Gongan ASR buffered session started")
@@ -100,7 +112,18 @@ class GonganASRProvider(BaseASRProvider):
 
         self._pcm_buf.extend(pcm)
         if not self._ws or self._closed:
-            logger.debug("Gongan ASR send_audio: ws closed, dropping frame")
+            self._schedule_buffered_partial()
+            self._closed_send_drop_count += 1
+            current = time.monotonic()
+            if (
+                self._closed_send_drop_count <= 3
+                or current - self._last_closed_send_log_mono >= 5.0
+            ):
+                self._last_closed_send_log_mono = current
+                logger.debug(
+                    "Gongan ASR send_audio: ws closed, keeping audio for "
+                    f"buffered partial/final recognition, dropped_live_frames={self._closed_send_drop_count}"
+                )
             return
         try:
             if not self._ready.is_set():
@@ -160,7 +183,11 @@ class GonganASRProvider(BaseASRProvider):
                     "Gongan ASR streaming returned empty result; "
                     f"falling back to buffered recognition with {len(pcm_bytes)} bytes"
                 )
-                text = await asyncio.to_thread(self._recognize_buffered, pcm_bytes)
+                text = await asyncio.to_thread(
+                    self._recognize_buffered,
+                    pcm_bytes,
+                    True,
+                )
         self._pcm_buf.clear()
         if text and self._use_punctuation:
             text = await asyncio.to_thread(self._client.restore_punctuation, text)
@@ -168,7 +195,31 @@ class GonganASRProvider(BaseASRProvider):
         logger.info(f"Gongan ASR result: {text!r}")
         return text
 
-    def _recognize_buffered(self, pcm_bytes: bytes) -> str:
+    def _schedule_buffered_partial(self) -> None:
+        if not self._buffered_partials or not self._partial_callback:
+            return
+        if len(self._pcm_buf) < self._partial_min_bytes:
+            return
+        if self._partial_task and not self._partial_task.done():
+            return
+        current = time.monotonic()
+        if current - self._last_partial_mono < self._partial_interval:
+            return
+        self._last_partial_mono = current
+        pcm_snapshot = bytes(self._pcm_buf)
+        self._partial_task = asyncio.create_task(
+            self._run_buffered_partial_preview(pcm_snapshot)
+        )
+
+    async def _run_buffered_partial_preview(self, pcm_bytes: bytes) -> None:
+        try:
+            text = await asyncio.to_thread(self._recognize_buffered, pcm_bytes, False)
+            if text:
+                await self._emit_partial(text, is_final=False)
+        except Exception as exc:
+            logger.warning(f"Gongan ASR buffered partial preview failed: {exc}")
+
+    def _recognize_buffered(self, pcm_bytes: bytes, emit_partials: bool = False) -> str:
         if not pcm_bytes:
             logger.warning("Gongan ASR buffered: no audio to send")
             return ""
@@ -220,6 +271,13 @@ class GonganASRProvider(BaseASRProvider):
                 text = data.get("result") or data.get("text") or ""
                 if text:
                     latest_text = text
+                    if emit_partials:
+                        loop = self._loop
+                        if loop and not loop.is_closed():
+                            asyncio.run_coroutine_threadsafe(
+                                self._emit_partial(text, is_final=False),
+                                loop,
+                            )
 
                 status = data.get("status")
                 signal = data.get("signal")
@@ -277,6 +335,15 @@ class GonganASRProvider(BaseASRProvider):
         self._done.set()
 
     async def close(self) -> None:
+        if self._partial_task and not self._partial_task.done():
+            self._partial_task.cancel()
+            try:
+                await self._partial_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._partial_task = None
         if self._recv_task:
             self._recv_task.cancel()
             try:
