@@ -19,10 +19,13 @@ class GonganASRProvider(BaseASRProvider):
         self._ws = None
         self._latest_text = ""
         self._recv_timeout = env_float("GONGAN_ASR_RECV_TIMEOUT", 3.0)
+        self._ready_timeout = env_float("GONGAN_ASR_READY_TIMEOUT", 3.0)
+        self._send_interval = env_float("GONGAN_ASR_SEND_INTERVAL", 0.01)
         self._use_punctuation = env_bool("GONGAN_ASR_PUNCTUATION", True)
         self._streaming = env_bool("GONGAN_ASR_STREAMING", False)
         self._pcm_buf = bytearray()
         self._recv_task = None
+        self._ready = asyncio.Event()
         self._done = asyncio.Event()
         self._closed = False
         self._partial_callback = None
@@ -51,7 +54,11 @@ class GonganASRProvider(BaseASRProvider):
 
     async def start_session(self) -> None:
         self._pcm_buf.clear()
+        self._latest_text = ""
         self._last_partial_text = ""
+        self._ready = asyncio.Event()
+        self._done = asyncio.Event()
+        self._closed = False
         if not self._streaming:
             await asyncio.to_thread(self._client.ensure_login)
             logger.info("Gongan ASR buffered session started")
@@ -77,17 +84,35 @@ class GonganASRProvider(BaseASRProvider):
         await self._ws.send(json.dumps({"signal": "start"}, ensure_ascii=False))
         self._recv_task = asyncio.create_task(self._recv_loop())
         logger.info(f"Gongan ASR session started -> {self._client.asr_ws_url}")
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=self._ready_timeout)
+            logger.info("Gongan ASR server_ready received; audio streaming enabled")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Gongan ASR server_ready timeout after {self._ready_timeout}s; "
+                "continuing with guarded audio send"
+            )
 
     async def send_audio(self, pcm: bytes) -> None:
         if not self._streaming:
             self._pcm_buf.extend(pcm)
             return
 
+        self._pcm_buf.extend(pcm)
         if not self._ws or self._closed:
             logger.debug("Gongan ASR send_audio: ws closed, dropping frame")
             return
         try:
+            if not self._ready.is_set():
+                await asyncio.wait_for(self._ready.wait(), timeout=self._ready_timeout)
             await self._ws.send(pcm)
+            if self._send_interval > 0:
+                await asyncio.sleep(self._send_interval)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Gongan ASR send_audio waiting server_ready timed out after "
+                f"{self._ready_timeout}s; dropping this frame"
+            )
         except ConnectionClosed as exc:
             self._closed = True
             self._done.set()
@@ -128,6 +153,15 @@ class GonganASRProvider(BaseASRProvider):
             logger.warning(f"Gongan ASR result wait timeout after {self._recv_timeout}s")
 
         text = self._latest_text.strip()
+        if not text:
+            pcm_bytes = bytes(self._pcm_buf)
+            if pcm_bytes:
+                logger.warning(
+                    "Gongan ASR streaming returned empty result; "
+                    f"falling back to buffered recognition with {len(pcm_bytes)} bytes"
+                )
+                text = await asyncio.to_thread(self._recognize_buffered, pcm_bytes)
+        self._pcm_buf.clear()
         if text and self._use_punctuation:
             text = await asyncio.to_thread(self._client.restore_punctuation, text)
 
@@ -227,8 +261,12 @@ class GonganASRProvider(BaseASRProvider):
             text = data.get("result") or data.get("text") or ""
             status = data.get("status")
             signal = data.get("signal")
+            if signal == "server_ready":
+                self._ready.set()
+                continue
             is_final = status in (2, "2") or signal in {"end", "finished"}
             if text:
+                self._ready.set()
                 self._latest_text = text
                 await self._emit_partial(text, is_final=is_final)
 
