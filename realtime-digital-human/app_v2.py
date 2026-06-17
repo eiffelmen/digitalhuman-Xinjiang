@@ -1397,7 +1397,7 @@ if __name__ == "__main__":
         help="头像ID",
     )
     parser.add_argument("--bbox_shift", type=int, default=5, help="边界框偏移")
-    parser.add_argument("--batch_size", type=int, default=16, help="批处理大小")
+    parser.add_argument("--batch_size", type=int, default=4, help="批处理大小")
     parser.add_argument(
         "--customvideo_config", type=str, default="", help="自定义视频配置文件路径"
     )

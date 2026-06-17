@@ -26,7 +26,8 @@ def _find_last_punct(text: str) -> int:
 
 
 def _clean_chunk(text: str) -> str:
-    return text.translate(str.maketrans("", "", "*#-"))
+    text = re.sub(r"<[^>]+>", "", text or "")
+    return text.translate(str.maketrans("", "", "*#-")).strip()
 
 
 def _build_query(message: str) -> str:

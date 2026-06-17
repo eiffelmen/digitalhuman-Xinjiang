@@ -12,7 +12,7 @@ import pickle
 import copy
 import queue
 import numpy as np
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 import asyncio
 from lipasr import LipASR
@@ -22,7 +22,6 @@ from basereal import BaseReal
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from loguru import logger
-from functools import lru_cache
 from collections import OrderedDict
 from perf_logger import elapsed_ms, log_perf, log_timepoint, now
 
@@ -201,32 +200,93 @@ def warm_up(batch_size, model, modelres):
 #         return list(tqdm(executor.map(load_image, img_list), total=len(img_list)))
 
 
+class LazyImageCycle:
+    def __init__(self, img_list, flag=False, cache_size=None, prefetch=None):
+        self.paths = list(img_list)
+        self.flag = flag
+        self.cache_size = max(1, int(cache_size or os.getenv("LS_IMAGE_CACHE_SIZE", "1200")))
+        self.prefetch = max(0, int(prefetch or os.getenv("LS_IMAGE_PREFETCH", "32")))
+        self._cache = OrderedDict()
+        self._futures = OrderedDict()
+        self._lock = Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(2, min(8, (os.cpu_count() or 4))),
+            thread_name_prefix="lazy_img_loader",
+        )
+        self.is_lazy = True
+        logger.info(
+            f"LazyImageCycle initialized frames={len(self.paths)} "
+            f"flag={self.flag} cache_size={self.cache_size} prefetch={self.prefetch}"
+        )
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __bool__(self):
+        return bool(self.paths)
+
+    def _normalize_index(self, idx):
+        if not self.paths:
+            raise IndexError("empty image cycle")
+        return int(idx) % len(self.paths)
+
+    def _load_image(self, idx):
+        img = cv2.imread(
+            self.paths[idx],
+            cv2.IMREAD_GRAYSCALE if self.flag else cv2.IMREAD_COLOR,
+        )
+        if img is None:
+            raise RuntimeError(f"failed to read image: {self.paths[idx]}")
+        return img
+
+    def _remember(self, idx, img):
+        self._cache[idx] = img
+        self._cache.move_to_end(idx)
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+
+    def _schedule_prefetch_locked(self, center_idx):
+        if self.prefetch <= 0:
+            return
+        for offset in range(1, self.prefetch + 1):
+            for candidate in (
+                self._normalize_index(center_idx + offset),
+                self._normalize_index(center_idx - offset),
+            ):
+                if candidate in self._cache or candidate in self._futures:
+                    continue
+                self._futures[candidate] = self._executor.submit(
+                    self._load_image,
+                    candidate,
+                )
+        while len(self._futures) > self.cache_size:
+            _, future = self._futures.popitem(last=False)
+            future.cancel()
+
+    def __getitem__(self, idx):
+        idx = self._normalize_index(idx)
+        future = None
+        with self._lock:
+            cached = self._cache.get(idx)
+            if cached is not None:
+                self._cache.move_to_end(idx)
+                self._schedule_prefetch_locked(idx)
+                return cached
+            future = self._futures.pop(idx, None)
+
+        img = future.result() if future is not None else self._load_image(idx)
+        with self._lock:
+            self._remember(idx, img)
+            self._schedule_prefetch_locked(idx)
+        return img
+
+    def prefetch_indices(self, center_idx):
+        with self._lock:
+            self._schedule_prefetch_locked(self._normalize_index(center_idx))
+
+
 def read_imgs(img_list, flag=False):
-    logger.info('读取图像中...')
-
-    max_workers = min(64, os.cpu_count() * 4)
-
-    @lru_cache(maxsize=1024)
-    def load_image_cached(img_path):
-        return cv2.imread(img_path,
-                          cv2.IMREAD_GRAYSCALE if flag else cv2.IMREAD_COLOR)
-
-    for img in img_list[:min(100, len(img_list))]:
-        load_image_cached(img)
-
-    future_order = OrderedDict()
-
-    with ThreadPoolExecutor(max_workers=max_workers,
-                            thread_name_prefix="img_loader") as executor:
-        for idx, img in enumerate(img_list):
-            future = executor.submit(load_image_cached, img)
-            future_order[idx] = future
-
-        results = [None] * len(img_list)
-        for idx, future in tqdm(future_order.items(), total=len(img_list)):
-            results[idx] = future.result()
-
-    return results
+    return LazyImageCycle(img_list, flag=flag)
 
 
 def __mirror_index(size, index):
@@ -629,12 +689,13 @@ class LipReal(BaseReal):
         self._next_render_linear_index = 0
         self._last_render_linear_index = None
         self._last_render_avatar_index = None
+        self._speech_start_reset_trace_id = None
         self.video_queue_max = int(
             os.getenv(
                 "WEBRTC_VIDEO_BACKPRESSURE_FRAMES",
-                os.getenv("WEBRTC_VIDEO_QUEUE_MAX", "3"),
+                os.getenv("WEBRTC_VIDEO_QUEUE_MAX", "16"),
             )
-            or 3
+            or 16
         )
         self.sync_speech_start_index = os.getenv(
             "WAV2LIP_SYNC_SPEECH_START_INDEX", "1"
@@ -1018,10 +1079,24 @@ class LipReal(BaseReal):
         logger.info(
             "WebRTC render assets: "
             f"source={src_w}x{src_h}, output={out_w}x{out_h}, "
-            f"scale={out_scale:.3f}, cache_size={self.render_cache_size}"
+            f"scale={out_scale:.3f}, cache_size={self.render_cache_size}, "
+            f"lazy_images={getattr(self.frame_list_cycle, 'is_lazy', False)}"
         )
 
-        if reset_cache and self.render_preload and out_scale < 0.999 and self.render_cache_size > 0:
+        if hasattr(self.frame_list_cycle, "prefetch_indices"):
+            self.frame_list_cycle.prefetch_indices(0)
+        if hasattr(self.mask_list_cycle, "prefetch_indices"):
+            self.mask_list_cycle.prefetch_indices(0)
+        if hasattr(self.face_list_cycle, "prefetch_indices"):
+            self.face_list_cycle.prefetch_indices(0)
+
+        if (
+            reset_cache
+            and self.render_preload
+            and not getattr(self.frame_list_cycle, "is_lazy", False)
+            and out_scale < 0.999
+            and self.render_cache_size > 0
+        ):
             preload_start = now()
             preload_count = min(len(self.frame_list_cycle), self.render_cache_size)
             for idx in range(preload_count):
@@ -1099,6 +1174,40 @@ class LipReal(BaseReal):
             loop.call_soon_threadsafe(put_frame)
         except Exception as exc:
             logger.debug(f"WebRTC loop put skipped: {exc}")
+
+    def _reset_webrtc_for_speech_start(self, trace_key, audio_track, video_track, loop, linear_idx, avatar_idx):
+        reset_counts = {}
+        for name, track in (("audio", audio_track), ("video", video_track)):
+            if track is None:
+                continue
+            reset = getattr(track, "reset_for_speech_start", None)
+            if callable(reset):
+                try:
+                    reset(loop)
+                    reset_counts[name] = "scheduled"
+                    continue
+                except Exception as exc:
+                    logger.debug(f"WebRTC {name} speech reset skipped: {exc}")
+            q = getattr(track, "_queue", None)
+            if q is not None:
+                reset_counts[name] = q.qsize()
+                try:
+                    q._queue.clear()
+                except Exception:
+                    pass
+        self._speech_start_reset_trace_id = trace_key
+        logger.info(
+            f"[SYNC_DIAG] reset_for_speech_start trace_key={trace_key} "
+            f"linear_idx={linear_idx} avatar_idx={avatar_idx} queues={reset_counts}"
+        )
+        log_perf(
+            "webrtc",
+            "speech_start_reset",
+            trace_id=trace_key,
+            linear_idx=linear_idx,
+            avatar_idx=avatar_idx,
+            queues=reset_counts,
+        )
 
     def process_frames(self,
                        quit_event,
@@ -1207,6 +1316,24 @@ class LipReal(BaseReal):
                 combine_frame[y1:y2, x1:x2] = res_frame
                 combine_frame = self.blend_images(combine_frame, mask_frame,
                                                   self._render_bg_img)
+
+            trace_id = getattr(self, "_pending_wav2lip_trace_id", None)
+            if self.speaking:
+                if trace_id:
+                    should_reset = self._speech_start_reset_trace_id != trace_id
+                    reset_key = trace_id
+                else:
+                    should_reset = _last_speaking_state is not True
+                    reset_key = f"linear:{linear_idx}"
+                if should_reset:
+                    self._reset_webrtc_for_speech_start(
+                        reset_key,
+                        audio_track,
+                        video_track,
+                        loop,
+                        linear_idx,
+                        idx,
+                    )
 
             if _last_speaking_state is None or _last_speaking_state != self.speaking:
                 logger.info(

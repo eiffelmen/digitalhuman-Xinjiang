@@ -41,11 +41,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-WEBRTC_AUDIO_QUEUE_MAX = _env_int("WEBRTC_AUDIO_QUEUE_MAX", 50)
-WEBRTC_VIDEO_QUEUE_MAX = _env_int("WEBRTC_VIDEO_QUEUE_MAX", 12)
-WEBRTC_VIDEO_KEEP_FRAMES = _env_int("WEBRTC_VIDEO_KEEP_FRAMES", 8)
+WEBRTC_AUDIO_QUEUE_MAX = _env_int("WEBRTC_AUDIO_QUEUE_MAX", 24)
+WEBRTC_VIDEO_QUEUE_MAX = _env_int("WEBRTC_VIDEO_QUEUE_MAX", 16)
+WEBRTC_VIDEO_HIGH_WATERMARK = _env_int("WEBRTC_VIDEO_HIGH_WATERMARK", 8)
+WEBRTC_VIDEO_KEEP_FRAMES = _env_int("WEBRTC_VIDEO_KEEP_FRAMES", 7)
 WEBRTC_DROP_LOG_INTERVAL = _env_float("WEBRTC_DROP_LOG_INTERVAL", 5.0)
 WEBRTC_VIDEO_LAG_RESET_S = _env_float("WEBRTC_VIDEO_LAG_RESET_S", 0.20)
+WEBRTC_VIDEO_TRIM_LEAD_S = _env_float("WEBRTC_VIDEO_TRIM_LEAD_S", 0.20)
 
 
 class PlayerStreamTrack(MediaStreamTrack):
@@ -89,23 +91,52 @@ class PlayerStreamTrack(MediaStreamTrack):
             return
         loop.call_soon_threadsafe(self._enqueue_frame_nowait, frame)
 
+    def reset_for_speech_start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._reset_queue_nowait, "speech_start")
+        else:
+            self._reset_queue_nowait("speech_start")
+
+    def _reset_queue_nowait(self, reason: str = "") -> None:
+        cleared = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+                cleared += 1
+            except asyncio.QueueEmpty:
+                break
+        if cleared:
+            logger.info(
+                f"WebRTC {self.kind} queue reset before speech start; "
+                f"cleared={cleared} reason={reason}"
+            )
+            log_perf(
+                "webrtc",
+                "track_queue_reset",
+                kind=self.kind,
+                cleared=cleared,
+                reason=reason,
+                queue_max=self._queue.maxsize,
+            )
+
     def _enqueue_frame_nowait(self, frame: Frame) -> None:
         if self.readyState != "live":
             return
 
         dropped = 0
         if self.kind == "video":
-            # 保留少量视频缓冲，让浏览器 jitter buffer 有连续帧可播放。
-            # 队列满时仍会丢旧帧，避免长时间累积延迟。
-            keep_frames = min(
-                max(1, WEBRTC_VIDEO_KEEP_FRAMES),
-                max(1, self._queue.maxsize - 1),
-            )
-            while self._queue.qsize() > keep_frames:
+            video_q = self._queue.qsize()
+            audio_track = getattr(self._player, "audio", None)
+            audio_q = audio_track.queue_size() if audio_track is not None else 0
+            video_lead_s = (video_q * VIDEO_PTIME) - (audio_q * AUDIO_PTIME)
+            keep_frames = min(max(1, WEBRTC_VIDEO_KEEP_FRAMES), max(1, self._queue.maxsize - 1))
+            if (
+                video_q >= WEBRTC_VIDEO_HIGH_WATERMARK
+                and video_q > keep_frames
+                and video_lead_s > WEBRTC_VIDEO_TRIM_LEAD_S
+            ):
                 if self._drop_oldest_frame():
                     dropped += 1
-                else:
-                    break
 
         while self._queue.full():
             if self._drop_oldest_frame():

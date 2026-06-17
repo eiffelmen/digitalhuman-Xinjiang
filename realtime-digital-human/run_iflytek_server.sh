@@ -22,6 +22,7 @@ fi
 exec uv run "${UV_RUN_ARGS[@]}" python app_v2.py \
   --max_session 10 \
   --avatar_id wav2lip_avatar11 \
+  --batch_size "${DIGITAL_HUMAN_BATCH_SIZE:-4}" \
   --tts "$TTS_PROVIDER" \
   --wav2lip_size 256 \
   --transport webrtc
