@@ -54,6 +54,45 @@ def _extract_answer(data) -> str:
     return content if isinstance(content, str) else ""
 
 
+def _use_agent_chat() -> bool:
+    default_enabled = bool(
+        os.environ.get("GONGAN_API_TOKEN")
+        or os.environ.get("API_KEY")
+        or os.environ.get("GONGAN_AGENT_FRIEND_ID")
+        or os.environ.get("GONGAN_AGENT_ID")
+    )
+    return env_bool("GONGAN_AGENT_ENABLED", default_enabled)
+
+
+def _build_agent_payload(message: str, model_id: str) -> dict:
+    friend_id = os.environ.get("GONGAN_AGENT_FRIEND_ID", "").strip()
+    agent_id = os.environ.get("GONGAN_AGENT_ID", "").strip()
+    if not friend_id and not agent_id:
+        raise RuntimeError(
+            "Gongan agent chat requires GONGAN_AGENT_FRIEND_ID or GONGAN_AGENT_ID."
+        )
+
+    payload = {
+        "modelId": model_id,
+        "history": [],
+        "query": _build_query(message),
+        "stream": True,
+        "exact_match": env_bool("GONGAN_AGENT_EXACT_MATCH", False),
+        "file_names": [],
+        "isBoot": os.environ.get("GONGAN_AGENT_IS_BOOT", "1"),
+    }
+    if friend_id:
+        payload["friendId"] = friend_id
+    else:
+        payload["agentId"] = agent_id
+
+    process_id = os.environ.get("GONGAN_AGENT_PROCESS_ID", "").strip()
+    if process_id:
+        # The upstream document spells this field as "prrocessId".
+        payload["prrocessId"] = process_id
+    return payload
+
+
 def _make_tts_sender(
     nerfreal: BaseReal,
     trace_id: Optional[str] = None,
@@ -171,25 +210,32 @@ def llm_response(
         send_tts(text)
 
     try:
-        client.ensure_ready()
-        url = f"{client.base_url}/aichat/chat/query"
-        payload = {
-            "query": _build_query(message),
-            "history": [],
-            "stream": True,
-            "startFlag": 0,
-            "groupId": None,
-            "useTmp": 0,
-            "kb_ids": [],
-            "file_names": [],
-            "is_only_specialized": False,
-            "modelId": client.ensure_model_id(),
-            "isBoot": "1",
-        }
+        use_agent = _use_agent_chat()
+        if use_agent:
+            client.ensure_login()
+            url = f"{client.base_url}/agentService/agentChat/query"
+            payload = _build_agent_payload(message, client.ensure_model_id())
+        else:
+            client.ensure_ready()
+            url = f"{client.base_url}/aichat/chat/query"
+            payload = {
+                "query": _build_query(message),
+                "history": [],
+                "stream": True,
+                "startFlag": 0,
+                "groupId": None,
+                "useTmp": 0,
+                "kb_ids": [],
+                "file_names": [],
+                "is_only_specialized": False,
+                "modelId": client.ensure_model_id(),
+                "isBoot": "1",
+            }
 
         logger.info(
             f"Start receiving Gongan LLM stream trace_id={msg_id}, "
-            f"sessionid={sessionid}, text_len={len(message)}, read_timeout={read_timeout}"
+            f"sessionid={sessionid}, text_len={len(message)}, "
+            f"read_timeout={read_timeout}, agent_chat={use_agent}"
         )
         log_timepoint(
             "LLM",
@@ -198,6 +244,7 @@ def llm_response(
             sessionid=sessionid,
             text_len=len(message),
             model=payload.get("modelId"),
+            agent_chat=use_agent,
         )
         post_start = now()
         response = client.session.post(

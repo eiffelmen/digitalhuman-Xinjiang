@@ -32,10 +32,15 @@ def env_float(name: str, default: float) -> float:
 
 class GonganAPIClient:
     def __init__(self) -> None:
-        self.base_url = os.environ.get("GONGAN_API_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+        self.base_url = os.environ.get(
+            "GONGAN_API_BASE_URL", os.environ.get("BASE_URL", DEFAULT_BASE_URL)
+        ).rstrip("/")
         self.tts_ws_url = os.environ.get("GONGAN_TTS_WS_URL", DEFAULT_TTS_WS_URL)
         self.asr_ws_url = os.environ.get("GONGAN_ASR_WS_URL", DEFAULT_ASR_WS_URL)
         self.origin = os.environ.get("GONGAN_API_ORIGIN", DEFAULT_ORIGIN)
+        self.api_token = os.environ.get(
+            "GONGAN_API_TOKEN", os.environ.get("API_KEY", "")
+        )
         self.username = os.environ.get(
             "GONGAN_API_USERNAME", os.environ.get("GONGAN_USERNAME", "")
         )
@@ -43,7 +48,16 @@ class GonganAPIClient:
             "GONGAN_API_PWD_MD5", os.environ.get("GONGAN_PWD_MD5", "")
         )
         self.model_name = os.environ.get("GONGAN_MODEL_NAME", "qwen3-14b")
-        self.model_id = os.environ.get("GONGAN_MODEL_ID") or None
+        self.model_id = (
+            os.environ.get("GONGAN_MODEL_ID")
+            or os.environ.get("GONGAN_AGENT_MODEL_ID")
+            or None
+        )
+        generic_model_name = os.environ.get("MODEL_NAME")
+        if not self.model_id and generic_model_name and generic_model_name.isdigit():
+            self.model_id = generic_model_name
+        elif generic_model_name:
+            self.model_name = generic_model_name
         self.timeout = env_float("GONGAN_API_TIMEOUT", 10.0)
         self.session = requests.Session()
         self.session_id: str | None = None
@@ -51,13 +65,17 @@ class GonganAPIClient:
 
     def ensure_login(self, force: bool = False) -> str:
         with self._lock:
+            if self.api_token:
+                self.session_id = self.api_token
+                return self.api_token
+
             if self.session_id and not force:
                 return self.session_id
 
             if not self.username or not self.pwd_md5:
                 raise RuntimeError(
-                    "Missing Gongan API credentials. Set GONGAN_API_USERNAME and "
-                    "GONGAN_API_PWD_MD5."
+                    "Missing Gongan API credentials. Set GONGAN_API_TOKEN/API_KEY, "
+                    "or set GONGAN_API_USERNAME and GONGAN_API_PWD_MD5."
                 )
 
             url = f"{self.base_url}/systemMgr/systemMgr/login"
@@ -84,6 +102,12 @@ class GonganAPIClient:
         with self._lock:
             if self.model_id and not force:
                 return self.model_id
+
+            if self.api_token:
+                raise RuntimeError(
+                    "Missing Gongan model id. Set GONGAN_MODEL_ID, "
+                    "GONGAN_AGENT_MODEL_ID, or numeric MODEL_NAME."
+                )
 
             session_id = self.ensure_login()
             url = f"{self.base_url}/model-service/llmModel/myListPage"
