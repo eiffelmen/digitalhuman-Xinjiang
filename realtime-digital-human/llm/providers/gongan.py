@@ -77,6 +77,8 @@ def _build_agent_payload(message: str, model_id: str) -> dict:
         "history": [],
         "query": _build_query(message),
         "stream": True,
+        "startFlag": 0,
+        "useTmp": 0,
         "exact_match": env_bool("GONGAN_AGENT_EXACT_MATCH", False),
         "file_names": [],
         "isBoot": os.environ.get("GONGAN_AGENT_IS_BOOT", "1"),
