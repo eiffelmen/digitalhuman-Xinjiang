@@ -148,6 +148,7 @@ export function useAudioStream(sessionId) {
         maxPowerLevel = Math.max(maxPowerLevel, powerLevel || 0)
         if (!started || !audioWs || audioWs.readyState !== WebSocket.OPEN) {
           droppedNotOpen += 1
+          buffers.length = 0
           if (
             started &&
             (!audioWs ||
@@ -160,6 +161,7 @@ export function useAudioStream(sessionId) {
         }
         if (audioWs.bufferedAmount > MAX_BUFFERED_BYTES) {
           droppedBuffered += 1
+          buffers.length = 0
           return
         }
 
@@ -168,6 +170,7 @@ export function useAudioStream(sessionId) {
           bufferSampleRate,
           16000,
         ).data
+        buffers.length = 0
 
         // 数字人正在说话时：检测到较大音量才触发打断，再送 ASR
         if (powerLevel > 20 && store.avatarSpeaking && !interruptCooling) {

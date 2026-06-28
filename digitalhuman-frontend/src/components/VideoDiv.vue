@@ -40,6 +40,11 @@ let videoErrorHandler = null;
 let audioWaitingHandler = null;
 let audioStalledHandler = null;
 let diagnostics = null;
+let iceConnectionStateChangeHandler = null;
+let iceGatheringStateChangeHandler = null;
+let signalingStateChangeHandler = null;
+let trackHandler = null;
+let connectionStateChangeHandler = null;
 let watchdogTimer = null;
 let reconnectTimer = null;
 let reconnectInProgress = false;
@@ -290,24 +295,24 @@ function start() {
 	startWatchdog(peer);
 	// pc = new RTCPeerConnection();
 
-	peer.addEventListener('iceconnectionstatechange', () => {
+	iceConnectionStateChangeHandler = () => {
 		diagnostics?.mark('ice_connection_state_change', {
 			iceConnectionState: peer.iceConnectionState,
 		});
-	});
-	peer.addEventListener('icegatheringstatechange', () => {
+	};
+	iceGatheringStateChangeHandler = () => {
 		diagnostics?.mark('ice_gathering_state_change', {
 			iceGatheringState: peer.iceGatheringState,
 		});
-	});
-	peer.addEventListener('signalingstatechange', () => {
+	};
+	signalingStateChangeHandler = () => {
 		diagnostics?.mark('signaling_state_change', {
 			signalingState: peer.signalingState,
 		});
-	});
+	};
 
 	// connect audio / video
-	peer.addEventListener('track', evt => {
+	trackHandler = evt => {
 		diagnostics?.mark('track_received', {
 			kind: evt.track.kind,
 			trackId: evt.track.id,
@@ -415,8 +420,8 @@ function start() {
 			audioElem.addEventListener('waiting', audioWaitingHandler);
 			audioElem.addEventListener('stalled', audioStalledHandler);
 		}
-	});
-	peer.addEventListener('connectionstatechange', () => {
+	};
+	connectionStateChangeHandler = () => {
 		if (pc !== peer) return;
 		diagnostics?.mark('connection_state_change', {
 			connectionState: peer.connectionState,
@@ -429,7 +434,13 @@ function start() {
 				connectionState: peer.connectionState,
 			});
 		}
-	});
+	};
+
+	peer.addEventListener('iceconnectionstatechange', iceConnectionStateChangeHandler);
+	peer.addEventListener('icegatheringstatechange', iceGatheringStateChangeHandler);
+	peer.addEventListener('signalingstatechange', signalingStateChangeHandler);
+	peer.addEventListener('track', trackHandler);
+	peer.addEventListener('connectionstatechange', connectionStateChangeHandler);
 
 	negotiate();
 }
@@ -472,9 +483,31 @@ function stop(options = {}) {
 	// close peer connection
 	loading.value = false;
 	try {
-		if (pc) pc.close();
+		if (pc) {
+			if (iceConnectionStateChangeHandler) {
+				pc.removeEventListener('iceconnectionstatechange', iceConnectionStateChangeHandler);
+				iceConnectionStateChangeHandler = null;
+			}
+			if (iceGatheringStateChangeHandler) {
+				pc.removeEventListener('icegatheringstatechange', iceGatheringStateChangeHandler);
+				iceGatheringStateChangeHandler = null;
+			}
+			if (signalingStateChangeHandler) {
+				pc.removeEventListener('signalingstatechange', signalingStateChangeHandler);
+				signalingStateChangeHandler = null;
+			}
+			if (trackHandler) {
+				pc.removeEventListener('track', trackHandler);
+				trackHandler = null;
+			}
+			if (connectionStateChangeHandler) {
+				pc.removeEventListener('connectionstatechange', connectionStateChangeHandler);
+				connectionStateChangeHandler = null;
+			}
+			pc.close();
+		}
 	} catch (e) {
-		console.log(e);
+		console.warn('close peer connection failed', e);
 	}
 	const videoElem = document.getElementById('video');
 	if (videoElem) {

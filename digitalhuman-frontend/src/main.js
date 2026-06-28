@@ -1,6 +1,7 @@
 import './assets/main.css'
 import './utils/rem';
 import './utils/logger'; // 导入logger，使其暴露到window对象
+import { installGlobalClientDiagnostics } from './utils/clientDiagnostics';
 
 import { createApp } from 'vue'
 
@@ -25,6 +26,8 @@ const vuetify = createVuetify({
 })
 
 const app = createApp(App)
+
+installGlobalClientDiagnostics()
 
 app.use(router)
 app.use(vuetify)

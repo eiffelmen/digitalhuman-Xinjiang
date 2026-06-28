@@ -231,6 +231,12 @@ function inboundSnapshot(report, state, elapsedSec) {
     bytesReceived: report.bytesReceived,
     packetsReceived: report.packetsReceived,
   });
+  if (state.prevStats.size > 100) {
+    const keys = Array.from(state.prevStats.keys());
+    for (let i = 0; i < keys.length - 50; i += 1) {
+      state.prevStats.delete(keys[i]);
+    }
+  }
 
   return {
     id: report.id,
@@ -303,6 +309,20 @@ function compactError(error) {
   };
 }
 
+function compactReason(reason) {
+  if (reason instanceof Error) return compactError(reason);
+  if (reason && typeof reason === 'object') {
+    return {
+      name: reason.name,
+      message: reason.message || JSON.stringify(reason).slice(0, 800),
+      stack: CLIENT_METRICS_VERBOSE ? reason.stack : undefined,
+    };
+  }
+  return {
+    message: String(reason),
+  };
+}
+
 function sendClientMetricsPayload(payload) {
   if (!CLIENT_METRICS_ENABLED) return;
   const body = JSON.stringify(payload);
@@ -333,6 +353,74 @@ export function postClientDiagnosticEvent(event, { sessionId, extra = {} } = {})
     sessionid: sessionId,
     page: pageSnapshot(MODULE_STARTED_AT),
     extra,
+  });
+}
+
+let globalDiagnosticsInstalled = false;
+
+export function installGlobalClientDiagnostics() {
+  if (globalDiagnosticsInstalled || typeof window === 'undefined') return;
+  globalDiagnosticsInstalled = true;
+
+  window.addEventListener('error', event => {
+    postClientDiagnosticEvent('window_error', {
+      extra: {
+        message: event.message,
+        filename: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+        error: compactError(event.error),
+      },
+    });
+  });
+
+  window.addEventListener('unhandledrejection', event => {
+    postClientDiagnosticEvent('unhandled_rejection', {
+      extra: {
+        reason: compactReason(event.reason),
+      },
+    });
+  });
+
+  window.addEventListener('online', () => {
+    postClientDiagnosticEvent('browser_online');
+  });
+
+  window.addEventListener('offline', () => {
+    postClientDiagnosticEvent('browser_offline');
+  });
+
+  window.addEventListener('pageshow', event => {
+    postClientDiagnosticEvent('pageshow', {
+      extra: {
+        persisted: event.persisted,
+      },
+    });
+  });
+
+  window.addEventListener('pagehide', event => {
+    postClientDiagnosticEvent('pagehide_global', {
+      extra: {
+        persisted: event.persisted,
+      },
+    });
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    postClientDiagnosticEvent('visibility_change_global', {
+      extra: {
+        visibilityState: document.visibilityState,
+        hidden: document.hidden,
+      },
+    });
+  });
+
+  document.addEventListener('freeze', () => {
+    postClientDiagnosticEvent('page_freeze');
+  });
+
+  document.addEventListener('resume', () => {
+    postClientDiagnosticEvent('page_resume');
   });
 }
 

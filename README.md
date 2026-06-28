@@ -117,25 +117,55 @@ VITE_CLIENT_METRICS_ENABLED=1
 VITE_CLIENT_METRICS_INTERVAL_MS=10000
 VITE_CLIENT_METRICS_VERBOSE=0
 VITE_AUDIO_STREAM_METRICS_INTERVAL_MS=10000
+VITE_WEBRTC_WATCHDOG_ENABLED=1
+VITE_WEBRTC_WATCHDOG_INTERVAL_MS=5000
+VITE_WEBRTC_NO_FRAME_TIMEOUT_MS=25000
+VITE_WEBRTC_BAD_CONNECTION_TIMEOUT_MS=8000
+VITE_WEBRTC_RECONNECT_DELAY_MS=1500
+VITE_WEBRTC_MAX_RECONNECTS=8
+VITE_WEBRTC_RELOAD_AFTER_RECONNECTS=1
 ```
 
-After rebuilding and restarting the frontend/backend, reproduce the problem in the browser until playback becomes choppy. Then collect the backend logs:
+Start the machine-level monitor in a separate terminal before the overnight test:
+
+```bash
+cd /home/dsd/wz/digitalhuman-Xinjiang/realtime-digital-human
+mkdir -p logs
+nohup bash scripts/monitor_system.sh 10 logs > logs/system_monitor.nohup 2>&1 &
+```
+
+After rebuilding and restarting the frontend/backend, reproduce the problem in the browser until playback becomes choppy or the Chrome tab crashes. Then collect the backend logs:
 
 ```bash
 cd /home/dsd/wz/digitalhuman-Xinjiang/realtime-digital-human
 latest_log=$(ls -t logs/file_*.log | head -1)
 
-grep -E '\[CLIENT_METRICS\]|\[SERVER_METRICS\]|actual avg final fps|queue dropped|interrupt request|audio_ws_|video_' "$latest_log" \
+grep -E '\[CLIENT_METRICS\]|\[CLIENT_METRICS_EVENT\]|\[CLIENT_EVENT\]|\[SERVER_METRICS\]|actual avg final fps|queue dropped|interrupt request|audio_ws_|video_|webrtc_' "$latest_log" \
   > /tmp/digitalhuman-stall-diagnostics.log
 ```
 
-Send `/tmp/digitalhuman-stall-diagnostics.log` and the full latest backend log if possible.
+Send these files for analysis:
+
+- `/tmp/digitalhuman-stall-diagnostics.log`
+- the full latest backend log under `realtime-digital-human/logs/`
+- the latest `realtime-digital-human/logs/system_monitor_*.log`
+- `realtime-digital-human/logs/system_monitor.nohup` if the monitor stopped unexpectedly
 
 What the diagnostics contain:
 
 - `[CLIENT_METRICS]`: browser-side video/audio element state, WebRTC ICE/connection state, inbound RTP stats, decoded/dropped video frame deltas, JS heap usage, page visibility, viewport, and audio capture/send counters.
+- `[CLIENT_METRICS_EVENT]` / `[CLIENT_EVENT]`: browser lifecycle and error events, including `window_error`, `unhandled_rejection`, `pagehide`, `pageshow`, `visibilitychange`, video `waiting/stalled/error`, WebRTC reconnect scheduling, and watchdog-triggered reloads.
 - `[SERVER_METRICS]`: backend process RSS/thread/file-descriptor snapshot, CUDA memory snapshot, active sessions, WebRTC peer connection states, per-session render queues, audio queues, TTS state, Wav2Lip frame queue, and track output queues.
+- `system_monitor_*.log`: machine-level CPU, memory, disk, Docker, Python backend process, Chrome renderer/GPU process, GPU utilization and GPU memory snapshots.
 - Event logs: WebRTC offer/answer timing, track arrival, video `playing/waiting/stalled/error`, audio WebSocket lifecycle, microphone recorder lifecycle, and interrupt requests.
+
+Initial diagnosis guide:
+
+- Chrome renderer RSS keeps growing while backend RSS is stable: browser/WebRTC/video decode leak or tab-level crash.
+- Backend Python RSS or open file descriptors keep growing: backend session, queue, cache, or resource cleanup issue.
+- GPU memory keeps growing: CUDA/TensorRT or Chrome GPU process resource leak.
+- Resource usage is stable but WebRTC changes to `failed`/`disconnected` or video decoded frame delta becomes zero: connection or media pipeline stall.
+- `[CLIENT_EVENT] window_error` or `unhandled_rejection` appears shortly before crash: frontend runtime exception should be investigated first.
 
 ## Response Latency And Lip-sync Diagnostics
 

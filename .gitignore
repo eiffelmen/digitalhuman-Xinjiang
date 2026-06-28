@@ -9,6 +9,8 @@ node_modules/
 dist/
 dist-electron/
 logs/
+tools/agent_service_test/.agent-test-venv/
+tools/agent_service_test/agent_service_test_logs/
 
 # Local secrets and certificates
 .env
