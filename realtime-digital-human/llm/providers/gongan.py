@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 from typing import Callable, Optional
 
 from loguru import logger
@@ -64,7 +65,102 @@ def _use_agent_chat() -> bool:
     return env_bool("GONGAN_AGENT_ENABLED", default_enabled)
 
 
-def _build_agent_payload(message: str, model_id: str) -> dict:
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return max(minimum, int(value))
+    except ValueError:
+        logger.warning(f"Invalid {name}={value!r}; using {default}")
+        return default
+
+
+def _trim_history(history: list[dict], max_chars: int) -> list[dict]:
+    if max_chars <= 0:
+        return history
+    trimmed: list[dict] = []
+    total = 0
+    for item in reversed(history):
+        content = item.get("content") or ""
+        if not content:
+            continue
+        if total + len(content) > max_chars and trimmed:
+            break
+        trimmed.append(item)
+        total += len(content)
+    return list(reversed(trimmed))
+
+
+def _fetch_agent_history(client, friend_id: str, trace_id: Optional[str] = None) -> list[dict]:
+    if not friend_id or not env_bool("GONGAN_AGENT_HISTORY_ENABLED", True):
+        return []
+
+    rows = _env_int("GONGAN_AGENT_HISTORY_ROWS", 1, minimum=0)
+    if rows <= 0:
+        return []
+
+    max_chars = _env_int("GONGAN_AGENT_HISTORY_MAX_CHARS", 2000, minimum=0)
+    timeout = env_float("GONGAN_AGENT_HISTORY_TIMEOUT", min(client.timeout, 3.0))
+    payload = {
+        "askEndTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "friendId": friend_id,
+        "page": 1,
+        "row": rows,
+    }
+    start = now()
+    try:
+        response = client.session.post(
+            f"{client.base_url}/agentService/agentChat/getChatInfo",
+            json=payload,
+            headers=client.token_header(),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != "success":
+            logger.warning(
+                f"Gongan agent history query failed trace_id={trace_id}: {data}"
+            )
+            return []
+
+        result = data.get("result", {})
+        items = result.get("items") if isinstance(result, dict) else result
+        if not isinstance(items, list):
+            return []
+
+        items = [item for item in items if isinstance(item, dict)]
+        items = sorted(items, key=lambda item: item.get("createTime", ""))
+        history: list[dict] = []
+        for item in items:
+            ask = (item.get("ask") or "").strip()
+            reply = (item.get("reply") or "").strip()
+            if ask:
+                history.append({"role": "user", "content": ask})
+            if reply:
+                history.append({"role": "assistant", "content": reply})
+
+        history = _trim_history(history, max_chars)
+        logger.info(
+            f"Gongan agent history loaded trace_id={trace_id}, "
+            f"rows={rows}, messages={len(history)}, chars={sum(len(i['content']) for i in history)}"
+        )
+        log_perf(
+            "llm",
+            "agent_history_loaded",
+            elapsed_ms(start),
+            trace_id=trace_id,
+            rows=rows,
+            messages=len(history),
+            chars=sum(len(i["content"]) for i in history),
+        )
+        return history
+    except Exception as exc:
+        logger.warning(f"Gongan agent history unavailable trace_id={trace_id}: {exc}")
+        return []
+
+
+def _build_agent_payload(message: str, model_id: str, client=None, trace_id: Optional[str] = None) -> dict:
     friend_id = os.environ.get("GONGAN_AGENT_FRIEND_ID", "").strip()
     agent_id = os.environ.get("GONGAN_AGENT_ID", "").strip()
     if not friend_id and not agent_id:
@@ -74,7 +170,7 @@ def _build_agent_payload(message: str, model_id: str) -> dict:
 
     payload = {
         "modelId": model_id,
-        "history": [],
+        "history": _fetch_agent_history(client, friend_id, trace_id) if client else [],
         "query": _build_query(message),
         "stream": True,
         "startFlag": 0,
@@ -216,7 +312,12 @@ def llm_response(
         if use_agent:
             client.ensure_login()
             url = f"{client.base_url}/agentService/agentChat/query"
-            payload = _build_agent_payload(message, client.ensure_model_id())
+            payload = _build_agent_payload(
+                message,
+                client.ensure_model_id(),
+                client=client,
+                trace_id=msg_id,
+            )
         else:
             client.ensure_ready()
             url = f"{client.base_url}/aichat/chat/query"
