@@ -1,5 +1,7 @@
 # Digital Human Xinjiang
 
+[中文 README](README.zh-CN.md)
+
 This is the cleaned source package for the Xinjiang digital human project.
 
 The Wav2Lip source code is stored in GitHub. Large model weights and avatar assets are not stored in GitHub. Download the runtime assets from Baidu Netdisk and restore them before running the backend.
@@ -35,6 +37,191 @@ See `ASSETS.md` for more details.
 3. Install backend dependencies in `realtime-digital-human/` with `uv sync`.
 4. Start the backend with `./start.sh`.
 5. Build or run the frontend from `digitalhuman-frontend/`.
+
+## XJDploy Recent Change Log
+
+This section records the main changes after the first intelligent-agent deployment package on branch `XJDploy`.
+
+Current reference points:
+
+- Intelligent-agent deployment baseline: `aa6b035` (`新疆项目部署版本，更换了新的智能体`)
+- Latest packaged code at the time of this note: `7927930` (`接入智能体历史上下文`)
+- If the local package is already `digitalhuman-Xinjiang-XJDploy-7927930.zip`, there are no newer committed changes on `origin/XJDploy` at the time this note was written.
+
+Change summary from `aa6b035` to `7927930`:
+
+| Commit | Area | Purpose |
+| --- | --- | --- |
+| `2a070d3` | Agent LLM request | Fixed intelligent-agent request payload fields to avoid `406 Not Acceptable` errors. |
+| `84b5ce2` | Frontend WebRTC | Added long-running WebRTC watchdog and automatic reconnect logic. |
+| `13f6bda` | Frontend and diagnostics | Reduced browser long-run crash risk and added client/server/system diagnostics. |
+| `71df69d` | ASR | Added Gongan streaming ASR reconnect, failure circuit breaker, buffered fallback, and detailed diagnostics. |
+| `7927930` | Agent history | Added `getChatInfo` history lookup and sends recent history into `agentChat/query`. |
+
+### Agent request and history
+
+The Gongan intelligent-agent provider is implemented in:
+
+```text
+realtime-digital-human/llm/providers/gongan.py
+```
+
+The agent path uses:
+
+```text
+POST /agentService/agentChat/query
+```
+
+The request payload includes these key fields:
+
+```json
+{
+  "modelId": "<GONGAN_AGENT_MODEL_ID or GONGAN_MODEL_ID>",
+  "friendId": "<GONGAN_AGENT_FRIEND_ID>",
+  "history": [],
+  "query": "<instruction + user question>",
+  "stream": true,
+  "startFlag": 0,
+  "useTmp": 0,
+  "exact_match": false,
+  "file_names": [],
+  "isBoot": "1"
+}
+```
+
+If `GONGAN_AGENT_PROCESS_ID` is configured, the provider sends it as `prrocessId`, matching the upstream API field spelling.
+
+History support works as follows:
+
+1. Before requesting `agentChat/query`, the backend calls:
+
+   ```text
+   POST /agentService/agentChat/getChatInfo
+   ```
+
+2. It fetches recent records by `GONGAN_AGENT_FRIEND_ID`.
+3. Each item is converted into OpenAI-style history:
+
+   ```json
+   [
+     {"role": "user", "content": "<previous ask>"},
+     {"role": "assistant", "content": "<previous reply>"}
+   ]
+   ```
+
+4. The converted history is sent in the next `agentChat/query` request.
+
+Recommended backend `.env` settings:
+
+```bash
+GONGAN_AGENT_ENABLED=1
+GONGAN_AGENT_FRIEND_ID=<friend id>
+GONGAN_AGENT_MODEL_ID=<model id>
+GONGAN_MODEL_ID=<model id>
+GONGAN_MODEL_NAME=<model name>
+
+GONGAN_AGENT_HISTORY_ENABLED=1
+GONGAN_AGENT_HISTORY_ROWS=1
+GONGAN_AGENT_HISTORY_MAX_CHARS=2000
+GONGAN_AGENT_HISTORY_TIMEOUT=3
+```
+
+Notes:
+
+- `GONGAN_AGENT_FRIEND_ID` is required for history lookup. If only `GONGAN_AGENT_ID` is configured, chat can still work, but history lookup returns empty.
+- `GONGAN_AGENT_HISTORY_ROWS=1` is intentionally conservative. It links the previous reply without dragging too much old context into the next request.
+- If multiple browser sessions share the same `GONGAN_AGENT_FRIEND_ID`, their conversation history may also be shared by the upstream service.
+
+### ASR streaming self-healing
+
+The Gongan ASR provider is implemented in:
+
+```text
+realtime-digital-human/asr/gongan.py
+```
+
+Recent changes added:
+
+- WebSocket ASR connection diagnostics.
+- One reconnect attempt when the streaming ASR socket closes unexpectedly.
+- Replay of buffered audio after reconnect.
+- Circuit breaker fallback to buffered ASR when streaming repeatedly fails.
+- More logs for token source, connection state, audio bytes sent, close code, close reason, and fallback path.
+
+Recommended backend `.env` settings when using streaming ASR:
+
+```bash
+GONGAN_ASR_STREAMING=1
+GONGAN_ASR_STREAM_RETRY_LIMIT=1
+GONGAN_ASR_STREAM_FAILURE_THRESHOLD=2
+GONGAN_ASR_STREAM_CIRCUIT_COOLDOWN=300
+GONGAN_ASR_STREAM_REPLAY_CHUNK_BYTES=4096
+GONGAN_ASR_STREAM_REPLAY_INTERVAL=0
+```
+
+If `GONGAN_ASR_STREAMING=0`, the project uses buffered ASR. In that mode, the streaming reconnect and circuit-breaker logic is intentionally bypassed.
+
+### Frontend WebRTC self-recovery
+
+The browser-side WebRTC recovery logic is mainly in:
+
+```text
+digitalhuman-frontend/src/components/VideoDiv.vue
+digitalhuman-frontend/src/utils/clientDiagnostics.js
+digitalhuman-frontend/src/composables/useAudioStream.js
+```
+
+Recent changes added:
+
+- Video frame watchdog.
+- WebRTC bad-state detection.
+- Automatic reconnect when no frame is received for a long time.
+- Automatic reload after repeated reconnect failures.
+- Cleanup of old peer event listeners before reconnect.
+- Browser global diagnostics for `window_error`, `unhandled_rejection`, page visibility, online/offline state, and page lifecycle events.
+- Bounded WebRTC stats memory to reduce long-running browser memory pressure.
+
+Recommended frontend `.env` settings before rebuilding the Docker image:
+
+```bash
+VITE_CLIENT_METRICS_ENABLED=1
+VITE_CLIENT_METRICS_INTERVAL_MS=10000
+VITE_CLIENT_METRICS_VERBOSE=0
+VITE_AUDIO_STREAM_METRICS_INTERVAL_MS=10000
+VITE_WEBRTC_WATCHDOG_ENABLED=1
+VITE_WEBRTC_WATCHDOG_INTERVAL_MS=5000
+VITE_WEBRTC_NO_FRAME_TIMEOUT_MS=25000
+VITE_WEBRTC_BAD_CONNECTION_TIMEOUT_MS=8000
+VITE_WEBRTC_RECONNECT_DELAY_MS=1500
+VITE_WEBRTC_MAX_RECONNECTS=8
+VITE_WEBRTC_RELOAD_AFTER_RECONNECTS=1
+```
+
+Frontend changes require rebuilding and recreating the frontend container:
+
+```bash
+cd digitalhuman-frontend
+sudo docker compose build --no-cache frontend
+sudo docker compose up -d --force-recreate frontend
+```
+
+### Long-run machine diagnostics
+
+A machine-level monitor was added at:
+
+```text
+realtime-digital-human/scripts/monitor_system.sh
+```
+
+Use it before overnight or long-running browser tests:
+
+```bash
+cd realtime-digital-human
+mkdir -p logs
+nohup bash scripts/monitor_system.sh 10 logs > logs/system_monitor.nohup 2>&1 &
+```
+
+It records CPU, memory, disk, Docker, backend Python process, Chrome process, GPU utilization, and GPU memory snapshots. These logs are used together with `[CLIENT_METRICS]` and `[SERVER_METRICS]` to determine whether a crash is caused by the browser, backend, GPU, WebRTC, or machine resource pressure.
 
 ## First Deployment Checklist
 
