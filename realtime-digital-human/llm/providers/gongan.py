@@ -1,10 +1,12 @@
 import asyncio
 import json
 import os
+import queue
 import re
 import time
 import uuid
 from datetime import datetime
+from threading import Event, Thread
 from typing import Callable, Optional
 
 from loguru import logger
@@ -196,27 +198,129 @@ def _make_tts_sender(
     trace_id: Optional[str] = None,
 ) -> tuple[Callable[[str], None], Callable[[], None]]:
     tts = getattr(nerfreal, "tts", None)
-    direct_tts = env_bool("GONGAN_DIRECT_TTS", True)
-    stream = None
+    can_direct_tts = bool(
+        env_bool("GONGAN_DIRECT_TTS", True)
+        and hasattr(tts, "start_text_stream")
+    )
+    direct_queue: queue.Queue[tuple[int, str] | None] = queue.Queue()
+    direct_done = Event()
     segment_index = 0
-    stream_start = now()
 
-    if direct_tts and hasattr(tts, "start_text_stream"):
+    def _is_active() -> bool:
+        is_active = getattr(nerfreal, "is_active_chat_trace", None)
+        return not (trace_id and callable(is_active) and not is_active(trace_id))
+
+    def _clear_active_tts_trace() -> None:
+        if hasattr(nerfreal, "clear_active_tts_trace"):
+            nerfreal.clear_active_tts_trace()
+
+    def _fallback_to_queue(clean_text: str, index: int) -> None:
+        nerfreal.put_msg_txt(
+            clean_text,
+            trace_id=trace_id,
+            segment_index=index,
+        )
+
+    def _direct_text_parts(clean_text: str) -> list[str]:
+        splitter = getattr(tts, "_split_tts_text", None)
+        if not callable(splitter):
+            return [clean_text]
         try:
-            stream = tts.start_text_stream()
-            logger.info(f"Gongan LLM direct TTS stream started trace_id={trace_id}")
-            log_perf(
-                "tts",
-                "direct_stream_start",
-                elapsed_ms(stream_start),
-                trace_id=trace_id,
-                direct_tts=True,
-            )
+            parts = [part for part in splitter(clean_text) if part.strip()]
+            return parts or [clean_text]
         except Exception as exc:
             logger.warning(
-                f"Gongan direct TTS unavailable, fallback to queue trace_id={trace_id}: {exc}"
+                f"Gongan direct TTS split failed trace_id={trace_id}, "
+                f"len={len(clean_text)}: {exc}"
             )
-            stream = None
+            return [clean_text]
+
+    def _run_direct_tts_segments() -> None:
+        try:
+            while True:
+                item = direct_queue.get()
+                if item is None:
+                    return
+                index, clean_text = item
+                if not _is_active():
+                    logger.info(
+                        f"Skip stale direct Gongan TTS segment trace_id={trace_id}, "
+                        f"segment_index={index}, len={len(clean_text)}"
+                    )
+                    continue
+
+                parts = _direct_text_parts(clean_text)
+                for part_index, part_text in enumerate(parts, start=1):
+                    if not _is_active():
+                        break
+                    stream = None
+                    try:
+                        if hasattr(nerfreal, "set_active_tts_trace"):
+                            nerfreal.set_active_tts_trace(trace_id, index)
+                        stream_start = now()
+                        stream = tts.start_text_stream()
+                        logger.info(
+                            f"Gongan LLM direct TTS segment stream started "
+                            f"trace_id={trace_id}, segment_index={index}, "
+                            f"part_index={part_index}/{len(parts)}, len={len(part_text)}"
+                        )
+                        log_perf(
+                            "tts",
+                            "direct_stream_start",
+                            elapsed_ms(stream_start),
+                            trace_id=trace_id,
+                            segment_index=index,
+                            part_index=part_index,
+                            part_count=len(parts),
+                            direct_tts=True,
+                            per_segment=True,
+                        )
+                        stream.send_text(part_text)
+                        stream.finish()
+                        diagnostics = (
+                            stream.diagnostics()
+                            if hasattr(stream, "diagnostics")
+                            else {}
+                        )
+                        log_perf(
+                            "tts",
+                            "direct_segment_stream_done",
+                            trace_id=trace_id,
+                            segment_index=index,
+                            part_index=part_index,
+                            part_count=len(parts),
+                            text_len=len(part_text),
+                            segments_sent=diagnostics.get("segments_sent"),
+                            segments_done=diagnostics.get("segments_done"),
+                            audio_packets=diagnostics.get("audio_packets"),
+                            audio_bytes=diagnostics.get("audio_bytes"),
+                            finish_wait_timed_out=diagnostics.get("finish_wait_timed_out"),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"Gongan direct TTS segment failed, fallback to queue "
+                            f"trace_id={trace_id}, segment_index={index}, "
+                            f"part_index={part_index}: {exc}"
+                        )
+                        try:
+                            if stream is not None and hasattr(stream, "abort"):
+                                stream.abort()
+                        except Exception:
+                            pass
+                        _fallback_to_queue(part_text, index)
+                    finally:
+                        _clear_active_tts_trace()
+        finally:
+            direct_done.set()
+
+    worker = None
+    if can_direct_tts:
+        worker = Thread(
+            target=_run_direct_tts_segments,
+            name=f"gongan-tts-{trace_id or 'stream'}",
+            daemon=True,
+        )
+        worker.start()
 
     def send(text: str) -> None:
         nonlocal segment_index
@@ -224,8 +328,7 @@ def _make_tts_sender(
         if not clean_text:
             return
         segment_index += 1
-        is_active = getattr(nerfreal, "is_active_chat_trace", None)
-        if trace_id and callable(is_active) and not is_active(trace_id):
+        if not _is_active():
             logger.info(
                 f"Skip stale Gongan TTS segment trace_id={trace_id}, "
                 f"segment_index={segment_index}, len={len(clean_text)}"
@@ -237,7 +340,7 @@ def _make_tts_sender(
             trace_id=trace_id,
             segment_index=segment_index,
             text_len=len(clean_text),
-            direct_tts=stream is not None,
+            direct_tts=can_direct_tts,
             first_char=clean_text[:1],
         )
         log_perf(
@@ -246,24 +349,29 @@ def _make_tts_sender(
             trace_id=trace_id,
             segment_index=segment_index,
             text_len=len(clean_text),
-            direct_tts=stream is not None,
+            direct_tts=can_direct_tts,
         )
-        if stream is not None:
-            if hasattr(nerfreal, "set_active_tts_trace"):
-                nerfreal.set_active_tts_trace(trace_id, segment_index)
-            stream.send_text(clean_text)
+        if can_direct_tts and worker is not None and not direct_done.is_set():
+            direct_queue.put((segment_index, clean_text))
         else:
-            nerfreal.put_msg_txt(
-                clean_text,
-                trace_id=trace_id,
-                segment_index=segment_index,
-            )
+            _fallback_to_queue(clean_text, segment_index)
 
     def finish() -> None:
-        if stream is not None:
-            stream.finish()
-        if hasattr(nerfreal, "clear_active_tts_trace"):
-            nerfreal.clear_active_tts_trace()
+        if can_direct_tts and worker is not None:
+            direct_queue.put(None)
+            finish_timeout = float(
+                getattr(tts, "_finish_timeout", env_float("GONGAN_TTS_FINISH_TIMEOUT", 20.0))
+            )
+            segment_timeout = float(
+                getattr(tts, "_segment_timeout", env_float("GONGAN_TTS_SEGMENT_TIMEOUT", 20.0))
+            )
+            timeout = max(5.0, (finish_timeout + segment_timeout + 2.0) * max(1, segment_index))
+            if not direct_done.wait(timeout=timeout):
+                logger.warning(
+                    f"Gongan direct TTS worker finish timed out trace_id={trace_id}, "
+                    f"segments={segment_index}, timeout={timeout:.1f}s"
+                )
+        _clear_active_tts_trace()
 
     return send, finish
 
