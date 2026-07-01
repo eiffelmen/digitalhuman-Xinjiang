@@ -46,6 +46,7 @@ from tomlkit import dumps, parse
 from lipreal import LipReal, load_model, load_avatar, warm_up
 from basereal import BaseReal
 from asr_session import ASRSessionHandler
+from build_nerf import build_nerfreal
 import aiohttp
 import aiohttp_cors
 from aiohttp import web
@@ -391,17 +392,6 @@ async def client_metrics(request):
     logger.info(f"{log_prefix} " + _json_dumps_for_log(envelope))
     return web.json_response({"code": 0, "data": "ok"})
 
-
-def build_nerfreal(session_id, opt, model, state: AppState):
-    """
-    创建并返回一个 LipReal 实例
-    """
-    opt.sessionid = session_id
-    if opt.model == "wav2lip":
-        from lipreal import LipReal
-
-        nerfreal = LipReal(opt, state.model, state.avatar)
-    return nerfreal
 
 def stop_nerfreal_instance(nerfreal: LipReal):
     """
