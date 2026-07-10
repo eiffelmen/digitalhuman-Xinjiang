@@ -709,6 +709,19 @@ class LipReal(BaseReal):
         self.video_max_width = int(os.getenv("WEBRTC_VIDEO_MAX_WIDTH", "540") or 0)
         self.video_max_height = int(os.getenv("WEBRTC_VIDEO_MAX_HEIGHT", "960") or 0)
         self.video_scale = float(os.getenv("WEBRTC_VIDEO_SCALE", "1.0") or 1.0)
+        self.canvas_enabled = os.getenv("WEBRTC_OUTPUT_16_9", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self.canvas_width = int(os.getenv("WEBRTC_OUTPUT_WIDTH", "960") or 960)
+        self.canvas_height = int(os.getenv("WEBRTC_OUTPUT_HEIGHT", "540") or 540)
+        self.canvas_person_right = float(
+            os.getenv("WEBRTC_PERSON_RIGHT_RATIO", "0.91") or 0.91
+        )
+        self.canvas_person_bottom = float(
+            os.getenv("WEBRTC_PERSON_BOTTOM_RATIO", "1.0") or 1.0
+        )
         self.render_fps = _env_float(
             "WEBRTC_RENDER_FPS",
             _env_float("WEBRTC_VIDEO_FPS", 25.0),
@@ -725,6 +738,9 @@ class LipReal(BaseReal):
         self._render_output_size = (0, 0)
         self._render_output_scale = 1.0
         self._render_bg_img = None
+        self._render_canvas_bg_img = None
+        self._render_canvas_size = None
+        self._render_person_offset = (0, 0)
         logger.info(
             "WebRTC output config: "
             f"queue_backpressure_frames={self.video_queue_max}, "
@@ -734,6 +750,8 @@ class LipReal(BaseReal):
             f"max_width={self.video_max_width}, "
             f"max_height={self.video_max_height}, "
             f"scale={self.video_scale}, "
+            f"canvas_16_9={self.canvas_enabled}, "
+            f"canvas={self.canvas_width}x{self.canvas_height}, "
             f"render_fps={self.render_fps:.2f}, "
             f"render_cache_size={self.render_cache_size}, "
             f"render_preload={self.render_preload}"
@@ -1056,12 +1074,65 @@ class LipReal(BaseReal):
     def _fallback_background(self, width, height):
         return np.full((height, width, 3), self.bg_fallback_bgr, dtype=np.uint8)
 
+    def _resize_cover(self, image, target_w, target_h):
+        src_h, src_w = image.shape[:2]
+        scale = max(target_w / max(src_w, 1), target_h / max(src_h, 1))
+        resize_w = max(target_w, int(round(src_w * scale)))
+        resize_h = max(target_h, int(round(src_h * scale)))
+        resized = cv2.resize(image, (resize_w, resize_h), interpolation=cv2.INTER_AREA)
+        left = max(0, (resize_w - target_w) // 2)
+        top = max(0, (resize_h - target_h) // 2)
+        return resized[top:top + target_h, left:left + target_w].copy()
+
+    def _fit_person_to_canvas(self, src_w, src_h):
+        canvas_w = max(2, self.canvas_width - self.canvas_width % 2)
+        canvas_h = max(2, self.canvas_height - self.canvas_height % 2)
+        person_scale = min(canvas_h / max(src_h, 1), canvas_w / max(src_w, 1))
+        person_w = max(2, int(round(src_w * person_scale)))
+        person_h = max(2, int(round(src_h * person_scale)))
+        person_w -= person_w % 2
+        person_h -= person_h % 2
+        person_w = max(2, min(canvas_w, person_w))
+        person_h = max(2, min(canvas_h, person_h))
+        return person_w, person_h, canvas_w, canvas_h, person_scale
+
+    def _compose_canvas_frame(self, person_frame):
+        if self._render_canvas_bg_img is None or self._render_canvas_size is None:
+            return person_frame
+
+        canvas = self._render_canvas_bg_img.copy()
+        h, w = person_frame.shape[:2]
+        canvas_h, canvas_w = canvas.shape[:2]
+        if (w, h) == self._render_output_size:
+            x, y = self._render_person_offset
+        else:
+            target_w, target_h, _, _, _ = self._fit_person_to_canvas(w, h)
+            if (target_w, target_h) != (w, h):
+                person_frame = cv2.resize(
+                    person_frame,
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                h, w = person_frame.shape[:2]
+            x = int(round(canvas_w * self.canvas_person_right - w))
+            y = int(round(canvas_h * self.canvas_person_bottom - h))
+        x = max(0, min(canvas_w - w, x))
+        y = max(0, min(canvas_h - h, y))
+        canvas[y:y + h, x:x + w] = person_frame
+        return canvas
+
     def _configure_render_assets(self, reset_cache=False):
         if not hasattr(self, "frame_list_cycle") or not self.frame_list_cycle:
             return
 
         src_h, src_w = self.frame_list_cycle[0].shape[:2]
-        out_w, out_h, out_scale = self._target_output_size(src_w, src_h)
+        if self.canvas_enabled:
+            out_w, out_h, canvas_w, canvas_h, out_scale = self._fit_person_to_canvas(
+                src_w, src_h
+            )
+        else:
+            out_w, out_h, out_scale = self._target_output_size(src_w, src_h)
+            canvas_w, canvas_h = out_w, out_h
         self._render_src_size = (src_w, src_h)
         self._render_output_size = (out_w, out_h)
         self._render_output_scale = out_scale
@@ -1069,9 +1140,23 @@ class LipReal(BaseReal):
         bg_img = self.bg_img
         if bg_img is None:
             bg_img = self._fallback_background(src_w, src_h)
-        if bg_img.shape[1] != out_w or bg_img.shape[0] != out_h:
-            bg_img = cv2.resize(bg_img, (out_w, out_h), interpolation=cv2.INTER_AREA)
-        self._render_bg_img = bg_img
+        if self.canvas_enabled:
+            canvas_bg = self._resize_cover(bg_img, canvas_w, canvas_h)
+            x = int(round(canvas_w * self.canvas_person_right - out_w))
+            y = int(round(canvas_h * self.canvas_person_bottom - out_h))
+            x = max(0, min(canvas_w - out_w, x))
+            y = max(0, min(canvas_h - out_h, y))
+            self._render_canvas_bg_img = canvas_bg
+            self._render_canvas_size = (canvas_w, canvas_h)
+            self._render_person_offset = (x, y)
+            self._render_bg_img = canvas_bg[y:y + out_h, x:x + out_w].copy()
+        else:
+            if bg_img.shape[1] != out_w or bg_img.shape[0] != out_h:
+                bg_img = cv2.resize(bg_img, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            self._render_bg_img = bg_img
+            self._render_canvas_bg_img = None
+            self._render_canvas_size = None
+            self._render_person_offset = (0, 0)
 
         if reset_cache:
             self._render_cache.clear()
@@ -1079,7 +1164,9 @@ class LipReal(BaseReal):
         logger.info(
             "WebRTC render assets: "
             f"source={src_w}x{src_h}, output={out_w}x{out_h}, "
-            f"scale={out_scale:.3f}, cache_size={self.render_cache_size}, "
+            f"scale={out_scale:.3f}, canvas={canvas_w}x{canvas_h}, "
+            f"person_offset={self._render_person_offset}, "
+            f"cache_size={self.render_cache_size}, "
             f"lazy_images={getattr(self.frame_list_cycle, 'is_lazy', False)}"
         )
 
@@ -1395,6 +1482,8 @@ class LipReal(BaseReal):
                 combine_frame, src_w, src_h, out_w, out_h, out_scale = (
                     self._resize_output_frame(combine_frame)
                 )
+            combine_frame = self._compose_canvas_frame(combine_frame)
+            out_h, out_w = combine_frame.shape[:2]
             new_frame = VideoFrame.from_ndarray(combine_frame, format="bgr24")
             if (
                 self.speaking

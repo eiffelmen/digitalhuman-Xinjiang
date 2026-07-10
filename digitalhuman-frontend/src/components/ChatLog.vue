@@ -342,7 +342,7 @@ onMounted(() => {
 	background-repeat: no-repeat;
 	background-position: center;
 	background-size: 100% 100%;
-	padding: clamp(42px, 6.5vh, 110px) clamp(70px, 11vw, 126px) clamp(80px, 13vh, 150px);
+	padding: clamp(38px, 5.5vh, 68px) clamp(48px, 5vw, 88px) clamp(52px, 8vh, 92px);
 }
 
 /* 隐藏滚动条 */
@@ -361,8 +361,8 @@ onMounted(() => {
 .chat-message {
 	width: 100%;
 	min-height: 100%;
-	font-size: clamp(26px, 3.2vw, 42px);
-	line-height: 1.35;
+	font-size: clamp(20px, 1.55vw, 32px);
+	line-height: 1.62;
 	color: #fff;
 	text-align: left;
 	text-shadow: 0 2px 8px rgba(0, 36, 84, 0.85);

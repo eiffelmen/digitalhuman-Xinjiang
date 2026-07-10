@@ -175,15 +175,16 @@ defineExpose({
 
 <style scoped>
 .chat-wrap {
-	background-size: 100%;
+	background-size: 100% 100%;
 	display: flex;
 	align-items: center;
-	padding: 0 50px;
+	padding: 0 clamp(18px, 1.8vw, 34px);
 }
 
 .chat-icon {
-	width: 164px;
-	height: 164px;
+	width: clamp(38px, 3vw, 58px);
+	height: clamp(38px, 3vw, 58px);
+	flex: 0 0 auto;
 }
 
 .chatview {
@@ -200,14 +201,14 @@ defineExpose({
 
 .message {
 	width: 100%;
-	font-size: 5.25rem;
+	font-size: clamp(18px, 1.35vw, 27px);
 	color: white;
-	padding-left: 50px;
-	line-height: 120px;
+	padding-left: clamp(12px, 1.2vw, 22px);
+	line-height: 1.45;
 	white-space: pre-wrap;
 	word-break: break-word;
-	padding-right: 20px;
-	max-height: 240px;
+	padding-right: 10px;
+	max-height: 5.8em;
 	overflow-y: auto;
 }
 </style>

@@ -346,14 +346,7 @@ onUnmounted(() => {
 			<div v-if="showName">
 				<img
 					:src="getPublicUrl('/name.png')"
-					class="position-absolute"
-					style="
-						top: 200px;
-						right: 130px;
-						transform: translateX(-50%);
-						width: 40px;
-						height: auto;
-					"
+					class="position-absolute name-badge"
 				/>
 			</div>
 			<!-- 右侧对话框 -->
@@ -413,25 +406,20 @@ onUnmounted(() => {
 				</div>
 			</div>
 
-		<div v-if="!showStandby">
-			<img :src="getPublicUrl('/bottom_info.png')" class="position-absolute bottom-info" />
-		</div>
-
 		<!-- 待机人像 -->
 		<div
 			v-if="showStandby"
 			class="standby-camera-video-content"
 		></div>
-
-		<div :style="`background-image: url('${getPublicUrl('/version_bg.png')}'); background-size: 100% 100%;`" class="version-content">Version 3.0.2</div>
 	</div>
 </template>
 
 <style scoped>
 #media {
 	background-repeat: no-repeat;
-	background-size: 100% 100%;
-	background-image: url(/video_bg2.jpg);
+	background-position: center center;
+	background-size: cover;
+	background-image: url('/digitalhuman_bg.jpg');
 }
 
 .left-box-video {
@@ -494,29 +482,31 @@ onUnmounted(() => {
 	transition: all 0.5s ease-in-out;
 }
 
+.name-badge {
+	top: 16%;
+	right: 17%;
+	width: clamp(28px, 2.2vw, 44px);
+	height: auto;
+	z-index: 20;
+}
+
 .chat-log {
-	width: min(84vw, 960px, 52vh);
+	width: min(31vw, 620px);
 	aspect-ratio: 1707 / 1318;
-	top: 56vh !important;
-	left: 50%;
-	transform: translateX(-50%);
+	top: 28% !important;
+	left: 14%;
 	z-index: 30;
 	pointer-events: none;
 }
 
-.bottom-info {
-	bottom: 60px;
-	left: 0;
-	width: 100%;
-	height: auto;
-	z-index: 10;
-	pointer-events: none;
-}
 .chat-quesiton{
-	height: 320px;
-	width: 1164px;
-	top: 1100px !important;
-	right: 230px !important;
+	width: min(22vw, 440px);
+	aspect-ratio: 1164 / 320;
+	height: auto;
+	top: 42% !important;
+	right: 17% !important;
+	z-index: 32;
+	pointer-events: none;
 }
 
 .loading-tips {
@@ -524,14 +514,15 @@ onUnmounted(() => {
 	font-weight: bold;
 }
 
-.version-content {
-	position: fixed;
-	height: 60px;
-	right: 60px;
-	bottom: 36px;
-	font-size: 46px;
-	color: #012557;
-	padding: 0 24px;
-	line-height: 60px;
+@media (max-aspect-ratio: 4 / 3) {
+	.chat-log {
+		width: min(46vw, 680px);
+		left: 4%;
+	}
+
+	.chat-quesiton {
+		width: min(31vw, 460px);
+		right: 5% !important;
+	}
 }
 </style>

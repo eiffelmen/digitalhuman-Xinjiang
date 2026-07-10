@@ -14,7 +14,6 @@
 				/>
 			</div>
 		</div>
-		<div :style="`background-image: url('${getPublicUrl('/version_bg.png')}'); background-size: 100% 100%;`" class="version-content">Version 3.0.2</div>
 	</div>
 </template>
 
@@ -29,8 +28,9 @@ import { getPublicUrl } from '@/utils/getAssets';
 	width: 100%;
 	position: relative;
 	background-repeat: no-repeat;
-	background-size: 100% 100%;
-	background-image: url(/video_bg2.jpg);
+	background-position: center center;
+	background-size: cover;
+	background-image: url('/digitalhuman_bg.jpg');
 }
 
 .camera-video-content {
@@ -68,14 +68,4 @@ import { getPublicUrl } from '@/utils/getAssets';
 	}
 }
 
-.version-content {
-	position: fixed;
-	height: 60px;
-	right: 60px;
-	bottom: 36px;
-	font-size: 46px;
-	color: #012557;
-	padding: 0 24px;
-	line-height: 60px;
-}
 </style>

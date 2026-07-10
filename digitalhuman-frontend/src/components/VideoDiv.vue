@@ -734,12 +734,11 @@ onUnmounted(() => {
 </template>
 <style scoped>
 #video {
-	background-color: gray;
-	height: 100%;
 	width: 100%;
-	background: url(/video_bg2.jpg) no-repeat;
-	background-size: 100% 100%;
-	object-fit: fill;
+	height: 100%;
+	display: block;
+	background: url('/digitalhuman_bg.jpg') center center / cover no-repeat;
+	object-fit: cover;
 }
 
 @keyframes rotate {
