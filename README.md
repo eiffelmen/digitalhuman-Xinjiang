@@ -132,6 +132,37 @@ Notes:
 - `GONGAN_AGENT_HISTORY_ROWS=1` is intentionally conservative. It links the previous reply without dragging too much old context into the next request.
 - If multiple browser sessions share the same `GONGAN_AGENT_FRIEND_ID`, their conversation history may also be shared by the upstream service.
 
+### Intranet ASR provider
+
+The intranet Qwen ASR provider is implemented in:
+
+```text
+realtime-digital-human/asr/innerasr.py
+```
+
+It only replaces ASR; the existing Gongan LLM and TTS providers remain
+unchanged. Configure it in `realtime-digital-human/.env`:
+
+```bash
+ASR_PROVIDER=innerasr
+LLM_PROVIDER=gongan
+TTS_PROVIDER=gongantts
+
+INNER_ASR_WS_URL=wss://<intranet-asr-host>:<port>/api/ws/asr
+INNER_ASR_ORIGIN=https://<intranet-asr-host>:<port>
+INNER_ASR_INSECURE=1
+INNER_ASR_CONNECT_TIMEOUT=10
+INNER_ASR_READY_TIMEOUT=10
+INNER_ASR_FINAL_TIMEOUT=30
+INNER_ASR_CHUNK_BYTES=12800
+```
+
+The client waits for `ready`, sends 16kHz mono PCM16LE binary audio, and
+sends `{"event":"commit"}` at speech end. Partial text is assembled from
+`partial.delta` / `replace_from`; final text is read from `final.full_text`.
+
+Set `ASR_PROVIDER=gongan` to switch back to the original provider.
+
 ### ASR streaming self-healing
 
 The Gongan ASR provider is implemented in:

@@ -4,12 +4,15 @@ from asr.base import BaseASRProvider
 from asr.iflytek import IflyTekASRProvider
 from asr.funasr import FunASRProvider
 from asr.gongan import GonganASRProvider
+from asr.innerasr import InnerASRProvider
 
 
 def create_asr_provider() -> BaseASRProvider:
     provider = os.environ.get("ASR_PROVIDER", "gongan")
     if provider == "gongan":
         return GonganASRProvider()
+    if provider == "innerasr":
+        return InnerASRProvider()
     if provider == "iflytek":
         return IflyTekASRProvider(
             app_id=os.environ["IFLYTEK_ASR_APP_ID"],

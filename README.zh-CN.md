@@ -132,6 +132,41 @@ GONGAN_AGENT_HISTORY_TIMEOUT=3
 - `GONGAN_AGENT_HISTORY_ROWS=1` 是保守配置，只关联上一轮回复，避免带入过多旧上下文。
 - 如果多个浏览器会话共用同一个 `GONGAN_AGENT_FRIEND_ID`，上游服务侧的对话历史也可能被共用。
 
+### 内网 ASR 接入
+
+内网 Qwen ASR provider 实现在：
+
+```text
+realtime-digital-human/asr/innerasr.py
+```
+
+它与原有警亿问通 ASR 相互独立。只切换 ASR，LLM 和 TTS 仍可继续使用
+`gongan` / `gongantts`。内网环境的 `.env` 配置示例：
+
+```bash
+ASR_PROVIDER=innerasr
+LLM_PROVIDER=gongan
+TTS_PROVIDER=gongantts
+
+INNER_ASR_WS_URL=wss://<内网ASR地址>:<端口>/api/ws/asr
+INNER_ASR_ORIGIN=https://<内网ASR地址>:<端口>
+INNER_ASR_INSECURE=1
+INNER_ASR_CONNECT_TIMEOUT=10
+INNER_ASR_READY_TIMEOUT=10
+INNER_ASR_FINAL_TIMEOUT=30
+INNER_ASR_CHUNK_BYTES=12800
+```
+
+协议固定为：连接后等待 `ready`，发送 16kHz、单声道、PCM16LE
+二进制音频，结束时发送 `{"event":"commit"}`。流式文本使用
+`partial.delta` 和 `replace_from` 合并，最终文本读取 `final.full_text`。
+
+回退到原 ASR 时只需修改：
+
+```bash
+ASR_PROVIDER=gongan
+```
+
 ### ASR 流式自恢复
 
 警亿问通 ASR provider 实现在：
