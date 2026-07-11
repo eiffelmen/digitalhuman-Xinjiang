@@ -714,8 +714,8 @@ class LipReal(BaseReal):
             "false",
             "no",
         }
-        self.canvas_width = int(os.getenv("WEBRTC_OUTPUT_WIDTH", "960") or 960)
-        self.canvas_height = int(os.getenv("WEBRTC_OUTPUT_HEIGHT", "540") or 540)
+        self.canvas_width = int(os.getenv("WEBRTC_OUTPUT_WIDTH", "1920") or 1920)
+        self.canvas_height = int(os.getenv("WEBRTC_OUTPUT_HEIGHT", "1080") or 1080)
         self.canvas_person_right = float(
             os.getenv("WEBRTC_PERSON_RIGHT_RATIO", "0.91") or 0.91
         )

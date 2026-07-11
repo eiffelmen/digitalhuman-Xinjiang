@@ -737,7 +737,7 @@ onUnmounted(() => {
 	width: 100%;
 	height: 100%;
 	display: block;
-	background: url('/digitalhuman_bg.jpg') center center / cover no-repeat;
+	background: url('/digitalhuman_bg.png') center center / cover no-repeat;
 	object-fit: cover;
 }
 

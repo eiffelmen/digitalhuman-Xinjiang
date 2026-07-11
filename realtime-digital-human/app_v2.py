@@ -1403,7 +1403,7 @@ if __name__ == "__main__":
         type=str,
         # default='/Data1/home/lishuang/realtime-digitalhuman/data/customimage/2.png',
         # default='./data/customimage/2.png',
-        default="./assets/digitalhuman_bg.jpg",
+        default="./assets/digitalhuman_bg.png",
         help="背景图片路径",
     )
 

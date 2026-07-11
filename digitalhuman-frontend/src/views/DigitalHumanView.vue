@@ -345,7 +345,7 @@ onUnmounted(() => {
 			<!-- 人名框 -->
 			<div v-if="showName">
 				<img
-					:src="getPublicUrl('/name.png')"
+					:src="getPublicUrl('/name-xiaomin.jpg')"
 					class="position-absolute name-badge"
 				/>
 			</div>
@@ -419,7 +419,7 @@ onUnmounted(() => {
 	background-repeat: no-repeat;
 	background-position: center center;
 	background-size: cover;
-	background-image: url('/digitalhuman_bg.jpg');
+	background-image: url('/digitalhuman_bg.png');
 }
 
 .left-box-video {
@@ -485,8 +485,8 @@ onUnmounted(() => {
 .name-badge {
 	top: 16%;
 	right: 17%;
-	width: clamp(28px, 2.2vw, 44px);
-	height: auto;
+	width: auto;
+	height: clamp(190px, 33vh, 320px);
 	z-index: 20;
 }
 

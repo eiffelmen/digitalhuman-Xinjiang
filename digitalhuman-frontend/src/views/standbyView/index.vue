@@ -30,7 +30,7 @@ import { getPublicUrl } from '@/utils/getAssets';
 	background-repeat: no-repeat;
 	background-position: center center;
 	background-size: cover;
-	background-image: url('/digitalhuman_bg.jpg');
+	background-image: url('/digitalhuman_bg.png');
 }
 
 .camera-video-content {
