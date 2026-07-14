@@ -484,7 +484,7 @@ onUnmounted(() => {
 
 .name-badge {
 	top: 16%;
-	right: 17%;
+	right: 12.5%;
 	width: auto;
 	height: clamp(190px, 33vh, 320px);
 	z-index: 20;
